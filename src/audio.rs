@@ -13,6 +13,27 @@ use std::{
 };
 
 unsafe extern "C" {
+    fn sonora_extract_audio(
+        source: *const c_char,
+        directory: *const c_char,
+        cancelled: extern "C" fn(*mut c_void) -> i32,
+        context: *mut c_void,
+        kind: *mut i32,
+        error: *mut c_char,
+        cap: usize,
+    ) -> i32;
+    fn sonora_writer_open(
+        path: *const c_char,
+        kind: i32,
+        rate: f64,
+        channels: u32,
+        frames: u64,
+        err: *mut c_char,
+        cap: usize,
+    ) -> *mut c_void;
+    fn sonora_writer_write(writer: *mut c_void, samples: *const f32, frames: u32) -> i32;
+    fn sonora_writer_close(writer: *mut c_void, finish: i32) -> i32;
+
     fn sonora_reader_open(
         path: *const c_char,
         rate: *mut f64,
@@ -70,8 +91,23 @@ pub struct AudioInfo {
     pub frames: u64,
     pub sample_rate: f64,
     pub channels: u32,
+    source: Option<PathBuf>,
+    temporary: Option<std::sync::Arc<TemporaryMedia>>,
+}
+#[derive(Debug)]
+struct TemporaryMedia(PathBuf);
+impl Drop for TemporaryMedia {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 impl AudioInfo {
+    pub fn source_path(&self) -> &Path {
+        self.source.as_deref().unwrap_or(&self.path)
+    }
+    pub fn is_extracted(&self) -> bool {
+        self.temporary.is_some()
+    }
     pub fn duration(&self) -> f64 {
         self.frames as f64 / self.sample_rate
     }
@@ -87,6 +123,8 @@ impl Reader {
             frames: 0,
             sample_rate: 0.,
             channels: 0,
+            source: None,
+            temporary: None,
         };
         let path = cpath(&info.path)?;
         let mut err = [0; 1024];
@@ -126,6 +164,63 @@ impl Drop for Reader {
 }
 pub fn probe(path: &Path) -> Result<AudioInfo> {
     Ok(Reader::open(path)?.info.clone())
+}
+
+/// Open audio directly, or extract the first audio track of a movie on a worker.
+/// Clones keep the private backing file alive for waveform/export jobs.
+pub fn prepare_media(path: &Path, cancel: &AtomicBool) -> Result<AudioInfo> {
+    ensure!(!cancel.load(Ordering::Relaxed), "Import cancelled");
+    let source = fs::canonicalize(path).context("Media file is unavailable")?;
+    let extension = source
+        .extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let movie = matches!(
+        extension.as_str(),
+        "mp4" | "mov" | "m4v" | "avi" | "mkv" | "webm" | "mts" | "m2ts"
+    );
+    if !movie && let Ok(info) = probe(&source) {
+        return Ok(info);
+    }
+    static NEXT_IMPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = std::env::temp_dir();
+    let temporary = loop {
+        let id = NEXT_IMPORT.fetch_add(1, Ordering::Relaxed);
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let dir = root.join(format!("sonora-media-{}-{stamp}-{id}", std::process::id()));
+        match fs::create_dir(&dir) {
+            Ok(()) => break std::sync::Arc::new(TemporaryMedia(dir)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    extern "C" fn cancelled(context: *mut c_void) -> i32 {
+        unsafe { (&*(context as *const AtomicBool)).load(Ordering::Relaxed) as i32 }
+    }
+    let mut kind = 0;
+    let mut error = [0; 1024];
+    let status = unsafe {
+        sonora_extract_audio(
+            cpath(&source)?.as_ptr(),
+            cpath(&temporary.0)?.as_ptr(),
+            cancelled,
+            cancel as *const AtomicBool as *mut c_void,
+            &mut kind,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    ensure!(status == 0, "{}", message(&error));
+    ensure!(!cancel.load(Ordering::Relaxed), "Import cancelled");
+    let mut info = probe(
+        &temporary
+            .0
+            .join(if kind == 0 { "audio.m4a" } else { "audio.caf" }),
+    )?;
+    info.source = Some(source);
+    info.temporary = Some(temporary);
+    Ok(info)
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Peak {
@@ -460,6 +555,182 @@ fn pcm24(sample: f32, gain: f32) -> [u8; 3] {
     let b = n.to_le_bytes();
     [b[0], b[1], b[2]]
 }
+
+/// The actual output codec, independent from the source filename.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportFormat {
+    Wav,
+    Mp3,
+    M4a,
+}
+impl ExportFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Wav => "wav",
+            Self::Mp3 => "mp3",
+            Self::M4a => "m4a",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wav => "WAV",
+            Self::Mp3 => "MP3",
+            Self::M4a => "M4A",
+        }
+    }
+}
+struct CompressedWriter(*mut c_void);
+impl CompressedWriter {
+    fn new(path: &Path, info: &AudioInfo, frames: u64, format: ExportFormat) -> Result<Self> {
+        let path = cpath(path)?;
+        let mut err = [0; 1024];
+        let kind = match format {
+            ExportFormat::Mp3 => 1,
+            ExportFormat::M4a => 2,
+            ExportFormat::Wav => unreachable!(),
+        };
+        let ptr = unsafe {
+            sonora_writer_open(
+                path.as_ptr(),
+                kind,
+                info.sample_rate,
+                info.channels,
+                frames,
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        ensure!(!ptr.is_null(), "{}", message(&err));
+        Ok(Self(ptr))
+    }
+    fn write(&mut self, samples: &[f32], frames: usize) -> Result<()> {
+        let status = unsafe { sonora_writer_write(self.0, samples.as_ptr(), frames as u32) };
+        ensure!(
+            status == 0,
+            "Audio encoding failed ({status}); no output was saved"
+        );
+        Ok(())
+    }
+    fn finish(mut self) -> Result<()> {
+        let ptr = std::mem::replace(&mut self.0, std::ptr::null_mut());
+        let status = unsafe { sonora_writer_close(ptr, 1) };
+        ensure!(
+            status == 0,
+            "Could not finish the encoded audio ({status}); no output was saved"
+        );
+        Ok(())
+    }
+}
+impl Drop for CompressedWriter {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                sonora_writer_close(self.0, 0);
+            }
+        }
+    }
+}
+/// Streams edited PCM into a real WAV, MP3 or AAC/M4A encoder. No external
+/// process, full-file intermediate, or unbounded PCM allocation is used.
+pub fn export_audio(
+    info: &AudioInfo,
+    edit: Edit,
+    destination: &Path,
+    format: ExportFormat,
+    cancel: &AtomicBool,
+    progress: &AtomicU32,
+) -> Result<()> {
+    if format == ExportFormat::Wav {
+        return export_wav(info, edit, destination, cancel, progress);
+    }
+    edit.validate(info)?;
+    ensure!(
+        info.channels <= 2,
+        "MP3 and M4A support mono or stereo. Choose WAV for multichannel audio."
+    );
+    ensure!(
+        !destination.exists(),
+        "This destination already exists. Choose a new name; originals are never overwritten."
+    );
+    if cancel.load(Ordering::Relaxed) {
+        bail!("Export cancelled");
+    }
+    let parent = fs::canonicalize(
+        destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )?;
+    let destination = parent.join(
+        destination
+            .file_name()
+            .context("Choose an output filename")?,
+    );
+    ensure!(
+        destination != fs::canonicalize(&info.path)?,
+        "The source cannot be overwritten"
+    );
+    let first = (edit.start * info.sample_rate).round() as u64;
+    let end = ((edit.end * info.sample_rate).round() as u64).min(info.frames);
+    let frames = end - first;
+    let mut reader = Reader::open(&info.path)?;
+    ensure!(
+        reader.info.frames == info.frames
+            && reader.info.channels == info.channels
+            && reader.info.sample_rate == info.sample_rate,
+        "Source changed; reopen it before exporting"
+    );
+    reader.seek(first)?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let temp = TempOutput(parent.join(format!(
+        ".sonora-{}-{stamp}.{}",
+        std::process::id(),
+        format.extension()
+    )));
+    // Reserve exclusively before the native encoder opens it. Only this private
+    // sibling file can be replaced by the AAC container writer.
+    drop(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temp.0)?,
+    );
+    let mut writer = CompressedWriter::new(&temp.0, info, frames, format)?;
+    let channels = info.channels as usize;
+    let mut buffer = vec![0.; CHUNK * channels];
+    let gain = 10f32.powf(edit.gain_db / 20.);
+    let mut done = 0u64;
+    progress.store(0, Ordering::Relaxed);
+    while done < frames {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("Export cancelled");
+        }
+        let want = (frames - done).min(CHUNK as u64) as usize;
+        let n = reader.read(&mut buffer[..want * channels])?;
+        ensure!(n > 0, "Source ended early; no output was saved");
+        for value in &mut buffer[..n * channels] {
+            *value = if value.is_finite() {
+                (*value * gain).clamp(-1., 1.)
+            } else {
+                0.
+            };
+        }
+        writer.write(&buffer[..n * channels], n)?;
+        done += n as u64;
+        progress.store((done * 990 / frames) as u32, Ordering::Relaxed);
+    }
+    writer.finish()?;
+    File::open(&temp.0)?.sync_all()?;
+    if cancel.load(Ordering::Relaxed) {
+        bail!("Export cancelled");
+    }
+    fs::hard_link(&temp.0, &destination)
+        .context("Could not save export (destination may already exist)")?;
+    progress.store(1000, Ordering::Relaxed);
+    Ok(())
+}
+
 pub fn export_wav(
     info: &AudioInfo,
     edit: Edit,
@@ -563,6 +834,8 @@ mod tests {
     #[test]
     fn rejects_invalid_edits() {
         let i = AudioInfo {
+            source: None,
+            temporary: None,
             path: PathBuf::new(),
             frames: 48000,
             sample_rate: 48000.,
@@ -613,12 +886,17 @@ mod pipeline_tests {
     }
     impl Fixture {
         fn new(frames: u64) -> Self {
+            static NEXT_FIXTURE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let dir =
-                std::env::temp_dir().join(format!("sonora-test-{}-{stamp}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!(
+                "sonora-test-{}-{stamp}-{sequence}",
+                std::process::id()
+            ));
             fs::create_dir_all(&dir).unwrap();
             let source = dir.join("tone.wav");
             let mut out = BufWriter::new(File::create(&source).unwrap());
@@ -664,7 +942,7 @@ mod pipeline_tests {
         let n = reader.read(&mut samples).unwrap();
         assert_eq!(n, 512);
         let gain = 10f32.powf(6. / 20.);
-        for (i, f) in samples.chunks_exact(2).enumerate() {
+        for (i, f) in samples.as_chunks::<2>().0.iter().enumerate() {
             let expected =
                 ((5904 + i) as f32 * std::f32::consts::TAU * 440. / 48000.).sin() * 0.2 * gain;
             assert!((f[0] - expected).abs() < 0.000001);
@@ -754,6 +1032,150 @@ mod pipeline_tests {
         })
         .unwrap();
         assert_eq!(calls, 1);
+    }
+    #[test]
+    fn compressed_exports_are_real_decodable_files() {
+        let f = Fixture::new(96000);
+        let before = fs::read(&f.source).unwrap();
+        let info = probe(&f.source).unwrap();
+        for format in [ExportFormat::Mp3, ExportFormat::M4a] {
+            let path = f.dir.join(format!("trim.{}", format.extension()));
+            let edit = Edit {
+                start: 0.2,
+                end: 1.4,
+                gain_db: 6.0,
+            };
+            let progress = AtomicU32::new(0);
+            export_audio(
+                &info,
+                edit,
+                &path,
+                format,
+                &AtomicBool::new(false),
+                &progress,
+            )
+            .unwrap();
+            assert_eq!(progress.load(Ordering::Relaxed), 1000);
+            let bytes = fs::read(&path).unwrap();
+            match format {
+                ExportFormat::Mp3 => assert!(bytes[0] == 0xff || &bytes[..3] == b"ID3"),
+                ExportFormat::M4a => assert_eq!(&bytes[4..8], b"ftyp"),
+                _ => unreachable!(),
+            }
+            let result = probe(&path).unwrap();
+            assert!(
+                (result.duration() - 1.2).abs() < 0.08,
+                "{format:?}: {}",
+                result.duration()
+            );
+            assert_eq!(result.channels, 2);
+            let mut reader = Reader::open(&path).unwrap();
+            let mut buffer = vec![0.; CHUNK * 2];
+            let mut peak = 0f32;
+            loop {
+                let n = reader.read(&mut buffer).unwrap();
+                if n == 0 {
+                    break;
+                }
+                for s in &buffer[..n * 2] {
+                    assert!(s.is_finite());
+                    peak = peak.max(s.abs());
+                }
+            }
+            assert!(
+                peak > 0.35 && peak < 0.46,
+                "{format:?} gain round-trip peak {peak}"
+            );
+            assert!(
+                export_audio(
+                    &info,
+                    edit,
+                    &path,
+                    format,
+                    &AtomicBool::new(false),
+                    &progress
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(before, fs::read(&f.source).unwrap());
+    }
+    #[test]
+    fn mono_compressed_export_resamples_supported_rates() {
+        let f = Fixture::new(1);
+        let mut out = File::create(&f.source).unwrap();
+        out.write_all(&wav_header(22050, 22050, 1).unwrap())
+            .unwrap();
+        for i in 0..22050 {
+            out.write_all(&pcm24((i as f32 * 0.125).sin() * 0.15, 1.))
+                .unwrap();
+        }
+        drop(out);
+        let info = probe(&f.source).unwrap();
+        for format in [ExportFormat::Mp3, ExportFormat::M4a] {
+            let path = f.dir.join(format!("mono.{}", format.extension()));
+            export_audio(
+                &info,
+                Edit::full(&info),
+                &path,
+                format,
+                &AtomicBool::new(false),
+                &AtomicU32::new(0),
+            )
+            .unwrap();
+            let result = probe(&path).unwrap();
+            assert_eq!(result.channels, 1);
+            assert_eq!(
+                result.sample_rate,
+                if format == ExportFormat::M4a {
+                    44100.
+                } else {
+                    32000.
+                }
+            );
+            assert!((result.duration() - 1.).abs() < 0.1);
+        }
+    }
+    #[test]
+    fn cancelled_compressed_export_never_publishes() {
+        let f = Fixture::new(48000 * 10);
+        let info = probe(&f.source).unwrap();
+        for format in [ExportFormat::Mp3, ExportFormat::M4a] {
+            let path = f.dir.join(format!("cancelled.{}", format.extension()));
+            let cancel = AtomicBool::new(false);
+            let progress = AtomicU32::new(0);
+            std::thread::scope(|scope| {
+                let job = scope.spawn(|| {
+                    export_audio(&info, Edit::full(&info), &path, format, &cancel, &progress)
+                });
+                let start = Instant::now();
+                while progress.load(Ordering::Relaxed) == 0 && start.elapsed().as_secs() < 5 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                cancel.store(true, Ordering::Relaxed);
+                assert!(job.join().unwrap().is_err());
+            });
+            assert!(!path.exists());
+            assert_eq!(fs::read_dir(&f.dir).unwrap().count(), 1);
+        }
+    }
+    #[test]
+    fn compressed_export_rejects_surround_without_writing() {
+        let f = Fixture::new(1000);
+        let mut info = probe(&f.source).unwrap();
+        info.channels = 6;
+        let path = f.dir.join("surround.mp3");
+        let error = export_audio(
+            &info,
+            Edit::full(&info),
+            &path,
+            ExportFormat::Mp3,
+            &AtomicBool::new(false),
+            &AtomicU32::new(0),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mono or stereo"));
+        assert!(!path.exists());
     }
     #[test]
     fn invalid_audio_is_rejected() {

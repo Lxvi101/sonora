@@ -1,25 +1,30 @@
-//! Rendering for the Sonora window. Layout, top to bottom: a quiet titlebar
-//! strip under the traffic lights, the stage (empty drop target or the
-//! waveform), the transport row, and a slim footer for facts and status.
+//! Rendering for the Sonora window. Top to bottom: a translucent black
+//! titlebar carrying the dotted mark and the file, the stage (an empty dot
+//! field, or the edit bar over the dot-matrix waveform), the transport, and
+//! a one-line status strip. Secondary controls fold away as the window
+//! narrows; every one of them stays reachable from the keyboard and menus.
 
 use gpui::{
     AnyElement, Context, Div, ExternalPaths, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
-    div, prelude::*, px,
+    MouseButton, ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    Window, div, prelude::*, px,
 };
 
-use super::widgets::{hint, icon, keycap, link_button, pill_button, round_button, tooltip};
+use super::logic::{self, FORMATS};
+use super::widgets::{
+    MARK_LARGE, MARK_SMALL, caps, dot_glyph, icon, icon_button, icon_ink, keycap, link_button,
+    play_button, primary_button, tooltip,
+};
 use super::*;
 
-const TITLEBAR: f32 = 38.0;
-const COMPACT: f32 = 780.0;
+const TITLEBAR: f32 = 40.0;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Clip {
     None,
-    /// Gain is above unity but we can't measure yet.
+    /// Gain is above unity but peaks aren't measured yet.
     Possible,
-    /// The preview overview says it will clip; the exact scan may refine it.
+    /// The quick overview says it will clip; the exact scan may refine it.
     Likely,
     Certain,
 }
@@ -27,8 +32,14 @@ enum Clip {
 impl Render for Sonora {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Animate only while the engine is playing; idle windows don't redraw.
-        if self.tick_playback() {
+        // The opening indicator animates too.
+        if self.tick_playback() || matches!(self.phase, Phase::Opening(_)) {
             window.request_animation_frame();
+        }
+        // Nothing else in the window takes focus, so an active window with no
+        // focus (after a native panel, say) is a lost keyboard: take it back.
+        if window.is_window_active() && window.focused(cx).is_none() {
+            self.refocus(window);
         }
 
         let title = match &self.phase {
@@ -39,9 +50,9 @@ impl Render for Sonora {
             window.set_window_title(&title);
             self.window_title = title;
         }
+        self.sync_menus(cx);
 
         let width = f32::from(window.viewport_size().width);
-        let compact = width < COMPACT;
 
         let root = div()
             .id("sonora")
@@ -55,20 +66,20 @@ impl Render for Sonora {
             .font_family(theme::UI_FONT)
             .text_size(px(12.5))
             .text_color(theme::text())
-            .on_drop(cx.listener(Self::dropped));
+            .on_drop(cx.listener(Self::dropped))
+            // Capture phase: runs even when a canvas stops propagation, so
+            // any click in the window gives the keyboard back to the editor.
+            .capture_any_mouse_down(cx.listener(|this, _, window, _| this.refocus(window)));
 
         let root = self.register_actions(root, cx);
         let ready = self.doc().is_some();
 
-        root.child(self.render_titlebar())
-            .child(self.render_stage(cx))
-            .when(ready, |root| {
-                root.child(self.render_transport(compact, width, cx))
-            })
-            .child(self.render_footer(compact, cx))
-            .when(!matches!(self.phase, Phase::Empty), |root| {
-                root.child(drop_overlay(cx))
-            })
+        root.child(self.render_titlebar(width))
+            .child(self.render_stage(width, cx))
+            .when(ready, |root| root.child(self.render_transport(width, cx)))
+            .child(self.render_footer(width, cx))
+            .child(drop_overlay(self.doc().is_some(), cx))
+            .when(self.help, |root| root.child(help_sheet(cx)))
     }
 }
 
@@ -79,35 +90,68 @@ impl Sonora {
 
     /// Actions are only registered when they can run, which also drives the
     /// enabled state of their menu items.
-    fn register_actions(
-        &self,
-        root: gpui::Stateful<Div>,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<Div> {
+    fn register_actions(&self, root: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
         let doc = self.doc();
         let ready = doc.is_some();
         let playable = doc.is_some_and(|d| d.playable);
         let exporting = doc.is_some_and(|d| d.export.is_some());
         let can_undo = doc.is_some_and(|d| !d.undo.is_empty());
         let can_redo = doc.is_some_and(|d| !d.redo.is_empty());
-        let edited = doc.is_some_and(Self::is_edited);
-        let cancellable = exporting || self.notice.is_some();
+        let edited = doc.is_some_and(Document::is_edited);
+        let zoomed = doc.is_some_and(|d| !d.view.is_full(d.duration()));
+        let opening = matches!(self.phase, Phase::Opening(_));
+        let cancellable = self.help || opening || exporting || self.notice.is_some();
+        let (wav, mp3, m4a) = (
+            self.can_use(ExportFormat::Wav),
+            self.can_use(ExportFormat::Mp3),
+            self.can_use(ExportFormat::M4a),
+        );
 
-        root.on_action(cx.listener(|this, _: &Open, _, cx| this.prompt_open(cx)))
+        root.on_action(cx.listener(|this, _: &Open, window, cx| this.prompt_open(window, cx)))
             .on_action(cx.listener(|_, _: &Minimize, window, _| window.minimize_window()))
             .on_action(cx.listener(|_, _: &Zoom, window, _| window.zoom_window()))
-            .when(ready, |root| {
+            .on_action(cx.listener(|this, _: &ToggleHelp, _, cx| this.toggle_help(cx)))
+            .on_action(cx.listener(|this, _: &ToggleLoop, _, cx| this.toggle_loop(cx)))
+            .when(wav, |root| {
+                root.on_action(
+                    cx.listener(|this, _: &UseWav, _, cx| this.set_format(ExportFormat::Wav, cx)),
+                )
+            })
+            .when(mp3, |root| {
+                root.on_action(
+                    cx.listener(|this, _: &UseMp3, _, cx| this.set_format(ExportFormat::Mp3, cx)),
+                )
+            })
+            .when(m4a, |root| {
+                root.on_action(
+                    cx.listener(|this, _: &UseM4a, _, cx| this.set_format(ExportFormat::M4a, cx)),
+                )
+            })
+            .when(ready || opening, |root| {
                 root.on_action(cx.listener(|this, _: &CloseFile, _, cx| this.close_file(cx)))
-                    .on_action(cx.listener(|this, _: &RevealSource, _, cx| this.reveal_source(cx)))
+            })
+            .when(ready, |root| {
+                root.on_action(cx.listener(|this, _: &RevealSource, _, cx| this.reveal_source(cx)))
                     .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
                     .on_action(cx.listener(|this, _: &SetIn, _, cx| this.set_in(cx)))
                     .on_action(cx.listener(|this, _: &SetOut, _, cx| this.set_out(cx)))
+                    .on_action(
+                        cx.listener(|this, _: &ResetStart, _, cx| {
+                            this.reset_edge(Handle::Start, cx)
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &ResetEnd, _, cx| this.reset_edge(Handle::End, cx)),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &ToggleOriginal, _, cx| this.toggle_original(cx)),
+                    )
                     .on_action(cx.listener(|this, _: &SeekBack, _, cx| this.seek_by(-1.0, cx)))
                     .on_action(cx.listener(|this, _: &SeekForward, _, cx| this.seek_by(1.0, cx)))
                     .on_action(cx.listener(|this, _: &SeekBackFar, _, cx| this.seek_by(-5.0, cx)))
+                    .on_action(cx.listener(|this, _: &SeekForwardFar, _, cx| this.seek_by(5.0, cx)))
                     .on_action(cx.listener(|this, _: &NudgeBack, _, cx| this.seek_by(-0.01, cx)))
                     .on_action(cx.listener(|this, _: &NudgeForward, _, cx| this.seek_by(0.01, cx)))
-                    .on_action(cx.listener(|this, _: &SeekForwardFar, _, cx| this.seek_by(5.0, cx)))
                     .on_action(cx.listener(|this, _: &GoToStart, _, cx| {
                         let start = this.doc().map_or(0.0, |d| d.edit.start);
                         this.seek_to(start, cx);
@@ -122,21 +166,25 @@ impl Sonora {
                     .on_action(
                         cx.listener(|this, _: &GainDown, _, cx| this.nudge_gain(-GAIN_STEP, cx)),
                     )
-                    .on_action(cx.listener(|this, _: &ResetGain, _, cx| {
-                        if let Some(doc) = this.doc() {
-                            let edit = Edit {
-                                gain_db: 0.0,
-                                ..doc.edit
-                            };
-                            this.apply_edit(edit, cx);
-                        }
-                    }))
+                    .on_action(cx.listener(|this, _: &ResetGain, _, cx| this.reset_gain(cx)))
+                    .on_action(
+                        cx.listener(|this, _: &ZoomToSelection, _, cx| this.zoom_to_selection(cx)),
+                    )
+                    .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_view(2.0, None, cx)))
+            })
+            .when(zoomed, |root| {
+                root.on_action(
+                    cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_view(0.5, None, cx)),
+                )
+                .on_action(cx.listener(|this, _: &ZoomToFit, _, cx| this.zoom_to_fit(cx)))
             })
             .when(playable, |root| {
                 root.on_action(cx.listener(|this, _: &PlayPause, _, cx| this.toggle_playback(cx)))
             })
             .when(ready && !exporting, |root| {
-                root.on_action(cx.listener(|this, _: &Export, _, cx| this.prompt_export(cx)))
+                root.on_action(
+                    cx.listener(|this, _: &Export, window, cx| this.prompt_export(window, cx)),
+                )
             })
             .when(edited, |root| {
                 root.on_action(cx.listener(|this, _: &ResetEdits, _, cx| this.reset_edits(cx)))
@@ -152,132 +200,381 @@ impl Sonora {
             })
     }
 
-    fn render_titlebar(&self) -> impl IntoElement {
-        let content: AnyElement = match &self.phase {
-            Phase::Ready(doc) => div()
-                .flex()
-                .items_center()
-                .gap(px(7.))
-                .min_w_0()
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::ivory(0.86))
-                        .child(doc.name.clone()),
-                )
-                .when(Self::is_edited(doc), |el| {
-                    el.child(
+    // ---- Titlebar ------------------------------------------------------
+
+    fn render_titlebar(&self, width: f32) -> impl IntoElement {
+        let brand = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(9.))
+            .child(dot_glyph(
+                &MARK_SMALL,
+                2.,
+                1.5,
+                theme::white(0.95),
+                theme::white(0.12),
+            ))
+            .child(caps("Sonora", 10., theme::text()));
+
+        let file: Option<AnyElement> = match &self.phase {
+            Phase::Ready(doc) => Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .min_w_0()
+                    .child(
                         div()
-                            .id("edited")
-                            .flex_none()
-                            .size(px(6.))
-                            .rounded_full()
-                            .bg(theme::accent(0.85))
-                            .tooltip(tooltip("Edited — the original stays untouched", None)),
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::text())
+                            .child(doc.name.clone()),
                     )
-                })
-                .into_any_element(),
-            Phase::Opening { name, .. } => div()
-                .min_w_0()
-                .truncate()
-                .text_color(theme::text_muted())
-                .child(format!("Opening {name}…"))
-                .into_any_element(),
-            Phase::Empty => div()
-                .text_color(theme::text_faint())
-                .font_weight(FontWeight::MEDIUM)
-                .child("Sonora")
-                .into_any_element(),
+                    .when(doc.is_edited(), |el| {
+                        el.child(
+                            div()
+                                .id("edited")
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .gap(px(5.))
+                                .tooltip(tooltip(
+                                    "Edited — the original file is never changed",
+                                    None,
+                                ))
+                                .child(div().size(px(5.)).rounded_full().bg(theme::white(0.9)))
+                                .child(caps("Edited", 9., theme::text_faint())),
+                        )
+                    })
+                    .when(doc.info.is_extracted(), |el| {
+                        el.child(
+                            div()
+                                .id("from-video")
+                                .flex_none()
+                                .h(px(16.))
+                                .px(px(5.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(4.))
+                                .border_1()
+                                .border_color(theme::white(0.2))
+                                .tooltip(tooltip(
+                                    "Audio from the video's first audio track. Exports are audio only.",
+                                    None,
+                                ))
+                                .child(caps("From video", 8., theme::text_muted())),
+                        )
+                    })
+                    .into_any_element(),
+            ),
+            Phase::Opening(import) => Some(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme::text_muted())
+                    .child(import.name.clone())
+                    .into_any_element(),
+            ),
+            Phase::Empty => None,
         };
+
+        let facts = self.doc().filter(|_| width >= 700.0).map(|doc| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(10.))
+                .font(theme::numeric(FontWeight::MEDIUM))
+                .text_size(px(11.))
+                .text_color(theme::text_faint())
+                .child(theme::sample_rate(doc.info.sample_rate))
+                .child(separator_dot())
+                .child(theme::channels(doc.info.channels))
+                .child(separator_dot())
+                .child(theme::timecode(doc.duration()))
+        });
 
         div()
             .h(px(TITLEBAR))
             .flex_none()
             .w_full()
-            .px(px(88.))
+            .pl(px(86.))
+            .pr(px(16.))
             .flex()
             .items_center()
-            .justify_center()
-            .text_size(px(12.5))
+            .gap(px(12.))
+            .bg(theme::chrome())
+            .border_b_1()
+            .border_color(theme::hairline())
             .on_mouse_down(MouseButton::Left, |event, window, _| {
                 if event.click_count == 2 {
                     window.titlebar_double_click();
                 }
             })
-            .child(content)
+            .child(brand)
+            .when_some(file, |bar, file| {
+                bar.child(div().w(px(1.)).h(px(14.)).bg(theme::white(0.14)))
+                    .child(file)
+            })
+            .child(div().flex_1())
+            .children(facts)
     }
 
-    fn render_stage(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let stage = div().flex_1().min_h_0().px(px(14.)).flex().flex_col();
+    // ---- Stage ---------------------------------------------------------
+
+    fn render_stage(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let stage = div()
+            .flex_1()
+            .min_h_0()
+            .px(px(12.))
+            .pt(px(8.))
+            .flex()
+            .flex_col();
         match &self.phase {
             Phase::Empty => stage.child(self.render_empty(cx)),
-            Phase::Opening { name, .. } => stage.child(
-                drop_zone()
-                    .child(glyph(0.45))
-                    .child(
-                        div()
-                            .mt(px(18.))
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(name.clone()),
-                    )
-                    .child(
-                        div()
-                            .mt(px(6.))
-                            .text_color(theme::text_muted())
-                            .child("Reading audio…"),
-                    ),
-            ),
+            Phase::Opening(import) => stage.child(render_opening(import, cx)),
             Phase::Ready(doc) => {
-                let playhead = self.position();
                 let dragging = match self.drag {
                     Some(Drag::Handle { handle, .. }) => Some(handle),
                     _ => None,
                 };
-                let message = if let Some(err) = &doc.wave_error {
-                    Some((
-                        SharedString::from(format!(
-                            "Waveform unavailable — {err} Preview and export still work."
-                        )),
-                        theme::coral(0.85),
-                    ))
+                let message: Option<SharedString> = if let Some(err) = &doc.wave_error {
+                    Some(
+                        format!("Waveform unavailable — {err} Preview and export still work.")
+                            .into(),
+                    )
                 } else if doc.peaks.is_none() {
-                    Some(("Reading waveform…".into(), theme::text_faint()))
+                    Some("Reading waveform…".into())
                 } else {
                     None
                 };
                 let scene = wave::WaveScene {
                     peaks: doc.peaks.clone(),
                     exact: doc.peaks_exact,
-                    duration: doc.info.duration(),
+                    duration: doc.duration(),
+                    view: doc.view,
                     start: doc.edit.start,
                     end: doc.edit.end,
-                    gain_db: doc.edit.gain_db,
-                    playhead,
+                    gain_db: doc.preview_gain(),
+                    playhead: self.position(),
                     hover: self.hover,
                     dragging,
                     message,
                 };
-                stage.child(
+                stage.child(self.render_edit_bar(doc, width, cx)).child(
                     div()
                         .flex_1()
                         .min_h_0()
-                        .rounded(px(12.))
+                        .rounded(px(10.))
                         .bg(theme::well())
                         .border_1()
                         .border_color(theme::hairline())
                         .overflow_hidden()
-                        .id("waveform")
-                        .tooltip(tooltip(
-                            "Click to place the playhead, drag to select · ⌥← → nudges 10 ms · I / O set trim",
-                            None,
-                        ))
                         .child(wave::waveform(scene, cx.entity().downgrade())),
                 )
             }
         }
+    }
+
+    /// The strip above the waveform: trim points and history on the left,
+    /// listening mode and zoom on the right.
+    fn render_edit_bar(
+        &self,
+        doc: &Document,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let edit = doc.edit;
+        let duration = doc.duration();
+        let can_undo = !doc.undo.is_empty();
+        let can_redo = !doc.redo.is_empty();
+        let edited = doc.is_edited();
+
+        let trim = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(2.))
+            .child(
+                trim_chip("set-in", "In", edit.start)
+                    .tooltip(tooltip(
+                        "Set start at playhead · ⇧I or double-click the handle resets it",
+                        Some("I"),
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_in(cx))),
+            )
+            .child(div().w(px(10.)).h(px(1.)).bg(theme::white(0.25)))
+            .child(
+                trim_chip("set-out", "Out", edit.end)
+                    .tooltip(tooltip(
+                        "Set end at playhead · ⇧O or double-click the handle resets it",
+                        Some("O"),
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_out(cx))),
+            );
+
+        let history = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(2.))
+            .child(
+                icon_button("undo", can_undo, false)
+                    .tooltip(tooltip("Undo", Some("⌘Z")))
+                    .when(can_undo, |b| {
+                        b.on_click(cx.listener(|this, _, _, cx| this.undo(cx)))
+                    })
+                    .child(icon("icons/undo.svg", 15., icon_ink(can_undo, false))),
+            )
+            .child(
+                icon_button("redo", can_redo, false)
+                    .tooltip(tooltip("Redo", Some("⇧⌘Z")))
+                    .when(can_redo, |b| {
+                        b.on_click(cx.listener(|this, _, _, cx| this.redo(cx)))
+                    })
+                    .child(icon("icons/redo.svg", 15., icon_ink(can_redo, false))),
+            )
+            .child(
+                icon_button("reset", edited, false)
+                    .tooltip(tooltip("Reset trim and gain", Some("⌘⌫")))
+                    .when(edited, |b| {
+                        b.on_click(cx.listener(|this, _, _, cx| this.reset_edits(cx)))
+                    })
+                    .child(icon("icons/reset.svg", 14., icon_ink(edited, false))),
+            );
+
+        let view = doc.view;
+        let zoomed = !view.is_full(duration);
+        let at_max = view.zoom(duration) >= logic::MAX_ZOOM - 1e-6;
+        let bins = doc.peaks.as_ref().map_or(0, |p| p.len());
+        // Roughly one dot column per 5 px of the well.
+        let columns = ((width - 24.0 - 32.0) / 5.0).max(1.0) as f64;
+        let magnified = bins > 0 && logic::visible_bins(bins, view, duration) < columns;
+
+        let readout = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.))
+            .when(magnified, |el| {
+                el.child(
+                    div()
+                        .id("overview-res")
+                        .px(px(6.))
+                        .h(px(18.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(theme::white(0.18))
+                        .tooltip(tooltip(
+                            format!(
+                                "Zoomed past the {bins}-point overview — dots are magnified; audio is untouched"
+                            ),
+                            None,
+                        ))
+                        .child(caps("Overview res", 8.5, theme::text_faint())),
+                )
+            })
+            .when(zoomed && width >= 900.0, |el| {
+                el.child(
+                    div()
+                        .font(theme::numeric(FontWeight::MEDIUM))
+                        .text_size(px(11.))
+                        .text_color(theme::text_muted())
+                        .child(format!(
+                            "{} – {}",
+                            theme::timecode(view.start),
+                            theme::timecode(view.end)
+                        )),
+                )
+            })
+            .child(
+                div()
+                    .min_w(px(30.))
+                    .font(theme::numeric(FontWeight::SEMIBOLD))
+                    .text_size(px(11.))
+                    .text_color(if zoomed { theme::text() } else { theme::text_ghost() })
+                    .child(format!("{:.1}×", view.zoom(duration))),
+            );
+
+        let zoom = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(2.))
+            .child(
+                icon_button("zoom-out", zoomed, false)
+                    .tooltip(tooltip("Zoom out", Some("⌘−")))
+                    .when(zoomed, |b| {
+                        b.on_click(cx.listener(|this, _, _, cx| this.zoom_view(0.5, None, cx)))
+                    })
+                    .child(icon("icons/zoom-out.svg", 15., icon_ink(zoomed, false))),
+            )
+            .child(
+                icon_button("zoom-in", !at_max, false)
+                    .tooltip(tooltip(
+                        "Zoom in · ⌘-scroll zooms at the pointer",
+                        Some("⌘="),
+                    ))
+                    .when(!at_max, |b| {
+                        b.on_click(cx.listener(|this, _, _, cx| this.zoom_view(2.0, None, cx)))
+                    })
+                    .child(icon("icons/zoom-in.svg", 15., icon_ink(!at_max, false))),
+            )
+            .child(
+                icon_button("zoom-sel", true, false)
+                    .tooltip(tooltip("Zoom to selection", Some("Z")))
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_to_selection(cx)))
+                    .child(icon("icons/zoom-selection.svg", 15., icon_ink(true, false))),
+            )
+            .child(
+                icon_button("zoom-fit", zoomed, false)
+                    .tooltip(tooltip("Show entire file", Some("⇧Z")))
+                    .when(zoomed, |b| {
+                        b.on_click(cx.listener(|this, _, _, cx| this.zoom_to_fit(cx)))
+                    })
+                    .child(icon("icons/zoom-fit.svg", 15., icon_ink(zoomed, false))),
+            );
+
+        let original = doc.original.then(|| {
+            div()
+                .id("original-badge")
+                .flex_none()
+                .h(px(20.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .rounded(px(10.))
+                .bg(theme::white(0.94))
+                .cursor_pointer()
+                .tooltip(tooltip(
+                    format!(
+                        "Hearing the original level. Export still applies {}.",
+                        theme::decibels(edit.gain_db)
+                    ),
+                    Some("B"),
+                ))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_original(cx)))
+                .child(caps("A · Original", 9., theme::black(0.9)))
+        });
+
+        div()
+            .h(px(38.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(trim)
+            .when(width >= 700.0, |bar| {
+                bar.child(vertical_rule()).child(history)
+            })
+            .child(div().flex_1())
+            .children(original)
+            .child(readout)
+            .child(zoom)
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -285,73 +582,71 @@ impl Sonora {
             Some(Notice::Error(message)) => Some(message.clone()),
             _ => None,
         };
-        drop_zone()
-            .id("drop-zone")
-            .drag_over::<ExternalPaths>(|style, _, _, _| {
-                style.border_color(theme::accent(0.55)).bg(theme::accent(0.06))
-            })
-            .on_drop(cx.listener(Self::dropped))
-            .child(glyph(1.0))
+        // Drops are taken by the whole-window overlay.
+        field_zone()
+            .child(dot_glyph(
+                &MARK_LARGE,
+                6.,
+                4.,
+                theme::white(0.96),
+                theme::white(0.07),
+            ))
             .child(
                 div()
-                    .mt(px(20.))
-                    .text_size(px(18.))
+                    .mt(px(26.))
+                    .text_size(px(22.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text())
-                    .child("Drop an audio file"),
+                    .child("Drop audio or video to begin."),
             )
             .child(
                 div()
-                    .mt(px(6.))
-                    .max_w(px(360.))
+                    .mt(px(8.))
+                    .max_w(px(400.))
                     .text_center()
                     .text_color(theme::text_muted())
-                    .child("Trim it, make it louder, and export a fresh WAV. Your original is never changed."),
+                    .child(
+                        "Trim, set the level, export WAV, MP3 or M4A. From a video, Sonora \
+                         edits its first audio track. The original is never touched.",
+                    ),
             )
             .child(
-                pill_button("open", false, true)
-                    .mt(px(22.))
-                    .tooltip(tooltip("Choose an audio file", Some("⌘O")))
-                    .on_click(cx.listener(|this, _, _, cx| this.prompt_open(cx)))
-                    .child(icon("icons/open.svg", 14., theme::text_muted()))
-                    .child("Open Audio…")
-                    .child(keycap("⌘O")),
+                primary_button("open", true)
+                    .mt(px(24.))
+                    .tooltip(tooltip("Choose an audio or video file", Some("⌘O")))
+                    .on_click(cx.listener(|this, _, window, cx| this.prompt_open(window, cx)))
+                    .child(icon("icons/open.svg", 14., theme::black(0.9)))
+                    .child("Open…"),
             )
             .when_some(error, |zone, message| {
                 zone.child(
                     div()
-                        .mt(px(16.))
+                        .mt(px(18.))
                         .w_full()
-                        .max_w(px(420.))
+                        .max_w(px(440.))
                         .flex()
                         .items_start()
-                        .gap(px(7.))
-                        .text_color(theme::coral(0.95))
-                        .child(
-                            div()
-                                .flex_none()
-                                .pt(px(1.))
-                                .child(icon("icons/warning.svg", 13., theme::coral(0.95))),
-                        )
+                        .gap(px(8.))
+                        .text_color(theme::text())
+                        .child(div().flex_none().pt(px(1.)).child(icon(
+                            "icons/warning.svg",
+                            14.,
+                            theme::white(1.0),
+                        )))
                         // A sized flex item so long messages wrap inside the row.
                         .child(div().flex_1().min_w_0().whitespace_normal().child(message)),
                 )
             })
-            .child(
-                div()
-                    .mt(px(26.))
-                    .text_size(px(11.))
-                    .text_color(theme::text_faint())
-                    .child("WAV · AIFF · MP3 · M4A · AAC · FLAC · CAF"),
-            )
+            .child(div().mt(px(30.)).child(caps(
+                "Wav  Aiff  Mp3  M4a  Aac  Flac  Caf  ·  Mov  Mp4  M4v",
+                9.,
+                theme::text_ghost(),
+            )))
     }
 
-    fn render_transport(
-        &self,
-        compact: bool,
-        width: f32,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    // ---- Transport -----------------------------------------------------
+
+    fn render_transport(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(doc) = self.doc() else {
             return div().into_any_element();
         };
@@ -360,17 +655,20 @@ impl Sonora {
         let exporting = doc.export.is_some();
         let edit = doc.edit;
         let clip = clip_state(doc);
-        let trim_min_width = if doc.info.duration() >= 3600.0 {
-            860.0
-        } else {
-            COMPACT
-        };
-        let gain_color = match clip {
-            Clip::Certain | Clip::Likely => theme::amber(1.0),
-            _ => theme::text(),
-        };
+        let format = self.export_format();
+        let fold = TransportFold::for_width(width);
 
-        let play = round_button("play", playable)
+        let to_start = icon_button("to-start", true, false)
+            .tooltip(tooltip("Go to selection start", Some("↑")))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let start = this.doc().map_or(0.0, |d| d.edit.start);
+                this.seek_to(start, cx);
+            }))
+            .child(icon("icons/to-start.svg", 14., icon_ink(true, false)));
+
+        // A distinct id per state, so hover and tooltip state never carry a
+        // stale "Play" across into playback (or back).
+        let play = play_button(if playing { "pause" } else { "play" }, playable)
             .tooltip(if !playable {
                 tooltip("Preview unavailable for this file", None)
             } else if playing {
@@ -387,166 +685,288 @@ impl Sonora {
                 } else {
                     "icons/play.svg"
                 },
-                16.,
+                17.,
                 if playable {
-                    theme::shade(0.92)
+                    theme::black(0.92)
                 } else {
-                    theme::text_faint()
+                    theme::text_ghost()
                 },
             ));
+
+        let looping = self.looping;
+        let loop_button = icon_button("loop", true, looping)
+            .tooltip(tooltip(
+                if looping {
+                    "Looping the selection — click to play once"
+                } else {
+                    "Loop the selection"
+                },
+                Some("L"),
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_loop(cx)))
+            .child(icon("icons/loop.svg", 15., icon_ink(true, looping)));
 
         let clock = div()
             .id("clock")
             .flex_none()
-            .min_w(px(96.))
+            .min_w(px(92.))
             .whitespace_nowrap()
-            .tooltip(tooltip("Playhead · selected duration", None))
+            .tooltip(tooltip("Playhead · selection length", None))
             .flex()
             .flex_col()
-            .gap(px(1.))
+            .gap(px(2.))
             .child(
                 div()
                     .font(theme::numeric(FontWeight::MEDIUM))
-                    .text_size(px(17.))
-                    .line_height(px(21.))
+                    .text_size(px(19.))
+                    .line_height(px(22.))
                     .text_color(theme::text())
                     .child(theme::timecode(self.position())),
             )
             .child(
                 div()
-                    .font(theme::numeric(FontWeight::NORMAL))
-                    .text_size(px(10.5))
-                    .text_color(theme::text_faint())
-                    .child(format!("Sel {}", theme::timecode(edit.end - edit.start))),
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(caps("Sel", 8.5, theme::text_faint()))
+                    .child(
+                        div()
+                            .font(theme::numeric(FontWeight::MEDIUM))
+                            .text_size(px(11.))
+                            .text_color(theme::text_muted())
+                            .child(theme::timecode(edit.end - edit.start)),
+                    ),
             );
 
-        let trim = div()
+        let original = doc.original;
+        let ab = div()
+            .id("ab")
             .flex()
             .flex_none()
             .items_center()
+            .h(px(24.))
+            .p(px(2.))
             .gap(px(2.))
-            .child(
-                trim_chip("set-in", "Start", edit.start)
-                    .tooltip(tooltip("Set start at playhead", Some("I")))
-                    .on_click(cx.listener(|this, _, _, cx| this.set_in(cx))),
-            )
-            .child(div().w(px(10.)).h(px(1.)).bg(theme::ivory(0.26)))
-            .child(
-                trim_chip("set-out", "End", edit.end)
-                    .tooltip(tooltip("Set end at playhead", Some("O")))
-                    .on_click(cx.listener(|this, _, _, cx| this.set_out(cx))),
-            )
-            .when(Self::is_edited(doc), |el| {
-                el.child(
-                    div()
-                        .id("reset")
-                        .ml(px(4.))
-                        .size(px(26.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(7.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme::ivory(0.07)))
-                        .active(|s| s.bg(theme::ivory(0.11)))
-                        .tooltip(tooltip("Reset trim and gain", Some("⌘⌫")))
-                        .on_click(cx.listener(|this, _, _, cx| this.reset_edits(cx)))
-                        .child(icon("icons/reset.svg", 14., theme::text_muted())),
-                )
-            });
+            .rounded(px(7.))
+            .border_1()
+            .border_color(theme::white(0.14))
+            .cursor_pointer()
+            .hover(|s| s.border_color(theme::white(0.3)))
+            .tooltip(tooltip(
+                "A/B — A plays the original level, B the edit. Preview only; export always uses B",
+                Some("B"),
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_original(cx)))
+            .child(ab_letter("A", original))
+            .child(ab_letter("B", !original));
+
+        let gain_readout = div()
+            .id("gain-readout")
+            // Wide enough for "+24.0 dB"; never wraps the unit.
+            .min_w(px(62.))
+            .flex_none()
+            .whitespace_nowrap()
+            .font(theme::numeric(FontWeight::SEMIBOLD))
+            .text_size(px(12.5))
+            .text_color(if original {
+                theme::text_faint()
+            } else {
+                theme::text()
+            })
+            .cursor_pointer()
+            .tooltip(tooltip("Gain · double-click for 0 dB", Some("+ / −")))
+            .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                if event.click_count() == 2 {
+                    this.reset_gain(cx);
+                }
+            }))
+            .child(theme::decibels(edit.gain_db));
 
         let gain = div()
             .flex()
             .flex_none()
             .items_center()
             .gap(px(8.))
-            .child(
-                div()
-                    .id("gain-icon")
-                    .tooltip(tooltip(
-                        "Gain — double-click the slider for 0 dB",
-                        Some("+ / −"),
-                    ))
-                    .child(icon("icons/volume.svg", 15., theme::text_muted())),
-            )
-            .child(wave::gain_slider(
-                wave::GainScene {
-                    gain_db: edit.gain_db,
-                    enabled: true,
-                    clipping: matches!(clip, Clip::Certain | Clip::Likely),
-                    dragging: matches!(self.drag, Some(Drag::Gain { .. })),
-                },
-                cx.entity().downgrade(),
-            ))
-            .child(
-                div()
-                    .w(px(54.))
-                    .flex_none()
-                    .font(theme::numeric(FontWeight::MEDIUM))
-                    .text_size(px(12.5))
-                    .text_color(gain_color)
-                    .child(theme::decibels(edit.gain_db)),
-            )
-            .child(clip_badge(clip));
-
-        let export = pill_button("export", true, !exporting)
-            .tooltip(tooltip(
-                if exporting {
-                    "Exporting…"
-                } else {
-                    "Export the selection as a new WAV"
-                },
-                Some("⇧⌘S"),
-            ))
-            .when(!exporting, |b| {
-                b.on_click(cx.listener(|this, _, _, cx| this.prompt_export(cx)))
+            .when(fold.gain_label, |el| {
+                el.child(caps("Gain", 8.5, theme::text_faint()))
             })
-            .child(icon(
-                "icons/export.svg",
-                14.,
-                if exporting {
-                    theme::text_faint()
+            .when_some(fold.slider, |el, slider_width| {
+                el.child(
+                    div()
+                        .id("gain-slider")
+                        .tooltip(tooltip(
+                            "Drag to set gain · double-click for 0 dB",
+                            Some("+ / −"),
+                        ))
+                        .child(wave::gain_slider(
+                            wave::GainScene {
+                                gain_db: edit.gain_db,
+                                dragging: matches!(self.drag, Some(Drag::Gain { .. })),
+                                width: slider_width,
+                            },
+                            cx.entity().downgrade(),
+                        )),
+                )
+            })
+            .child(gain_readout)
+            .child(clip_badge(clip))
+            .when(fold.ab, |el| el.child(ab));
+
+        let formats = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(28.))
+            .p(px(2.))
+            .gap(px(2.))
+            .rounded(px(8.))
+            .bg(theme::white(0.04))
+            .border_1()
+            .border_color(theme::white(0.12))
+            .children(FORMATS.iter().map(|&f| {
+                let usable = self.can_use(f) && !exporting;
+                let selected = f == format;
+                let keys = match f {
+                    ExportFormat::Wav => "⌘1",
+                    ExportFormat::Mp3 => "⌘2",
+                    ExportFormat::M4a => "⌘3",
+                };
+                let tip = if self.can_use(f) {
+                    format!("{} · {}", f.label(), logic::format_detail(f))
                 } else {
-                    theme::accent(1.0)
-                },
-            ))
-            .child(if compact { "Export" } else { "Export WAV" });
+                    format!(
+                        "{} needs mono or stereo — this file has {} channels",
+                        f.label(),
+                        doc.info.channels
+                    )
+                };
+                div()
+                    .id(SharedString::from(format!("format-{}", f.extension())))
+                    .h_full()
+                    .px(px(if fold.tight_formats { 6. } else { 8. }))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.))
+                    .font(theme::numeric(FontWeight::SEMIBOLD))
+                    .text_size(px(10.5))
+                    .tooltip(tooltip(tip, Some(keys)))
+                    .map(|el| match (selected, usable) {
+                        (true, _) => el.bg(theme::white(0.94)).text_color(theme::black(0.92)),
+                        (false, true) => el
+                            .text_color(theme::text_muted())
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::white(0.08)).text_color(theme::text())),
+                        (false, false) => el.text_color(theme::text_ghost()),
+                    })
+                    .when(usable && !selected, |el| {
+                        el.on_click(cx.listener(move |this, _, _, cx| this.set_format(f, cx)))
+                    })
+                    .child(if fold.tight_formats {
+                        f.label().to_string()
+                    } else {
+                        theme::tracked(f.label())
+                    })
+            }));
+
+        let export: AnyElement = match &doc.export {
+            Some(job) => {
+                let fraction = job.shown as f32 / 1000.0;
+                let cancelling = job.cancel.load(Ordering::Relaxed);
+                primary_button("export", false)
+                    .min_w(px(104.))
+                    .justify_center()
+                    .text_color(theme::text())
+                    .when(!cancelling, |b| {
+                        b.cursor_pointer()
+                            .hover(|s| s.bg(theme::white(0.14)))
+                            .tooltip(tooltip("Cancel export", Some("Esc")))
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
+                    })
+                    .child(if cancelling {
+                        "Cancelling…".to_string()
+                    } else {
+                        format!("{}%", (fraction * 100.0).floor() as u32)
+                    })
+                    .into_any_element()
+            }
+            None => primary_button("export", true)
+                .tooltip(tooltip(
+                    format!(
+                        "Export the selection as {} ({})",
+                        format.label(),
+                        logic::format_detail(format)
+                    ),
+                    Some("⇧⌘S"),
+                ))
+                .on_click(cx.listener(|this, _, window, cx| this.prompt_export(window, cx)))
+                .child(icon("icons/export.svg", 13., theme::black(0.9)))
+                .child(format!("Export {}", format.label()))
+                .into_any_element(),
+        };
+
+        // The right-hand group (gain, format, Export) never shrinks; if the
+        // estimates in `TransportFold` are ever short, the playback cluster
+        // on the left is what gets clipped, never the Export button.
+        let playback = div()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .when(fold.to_start, |row| row.child(to_start))
+            .child(play)
+            .child(loop_button)
+            .child(div().flex_none().w(px(4.)))
+            .child(clock);
+        let output = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(10.))
+            .child(gain)
+            .child(vertical_rule())
+            .child(formats)
+            .child(export);
 
         div()
             .h(px(64.))
             .flex_none()
-            .px(px(18.))
+            .px(px(16.))
             .flex()
             .items_center()
-            .gap(px(12.))
-            .child(play)
-            .child(clock)
-            // Multi-hour timecodes are wider; drop the trim chips sooner
-            // rather than squeezing them (I / O and the handles still work).
-            .when(!compact && width >= trim_min_width, |row| row.child(trim))
-            .child(div().flex_1())
-            .child(gain)
-            .child(export)
+            .gap(px(10.))
+            .child(playback)
+            .child(output)
             .into_any_element()
     }
 
-    fn render_footer(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let facts: Option<String> = self.doc().map(|doc| {
-            let mut parts = vec![
-                theme::sample_rate(doc.info.sample_rate),
-                theme::channels(doc.info.channels),
-                theme::timecode(doc.info.duration()),
-            ];
-            if !compact && let Some(peak) = selection_peak(doc) {
-                let gained = peak * 10f32.powf(doc.edit.gain_db / 20.0);
-                let approx = if doc.peaks_exact { "" } else { "≈ " };
-                parts.push(if gained > 0.0 {
-                    format!("Peak {approx}{}", dbfs(gained))
-                } else {
-                    "Silent".into()
-                });
-            }
-            parts.join("  ·  ")
+    // ---- Status strip --------------------------------------------------
+
+    fn render_footer(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let peak = self.doc().filter(|_| width >= 700.0).and_then(|doc| {
+            let peak = selection_peak(doc)?;
+            let gained = peak * 10f32.powf(doc.edit.gain_db / 20.0);
+            let approx = if doc.peaks_exact { "" } else { "≈ " };
+            Some(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(7.))
+                    .child(caps("Peak", 8.5, theme::text_ghost()))
+                    .child(
+                        div()
+                            .font(theme::numeric(FontWeight::MEDIUM))
+                            .text_size(px(11.))
+                            .text_color(theme::text_muted())
+                            .child(if gained > 0.0 {
+                                format!("{approx}{}", dbfs(gained))
+                            } else {
+                                "Silent".into()
+                            }),
+                    ),
+            )
         });
 
         div()
@@ -558,16 +978,10 @@ impl Sonora {
             .gap(px(12.))
             .border_t_1()
             .border_color(theme::hairline())
-            .bg(theme::shade(0.10))
-            .text_size(px(11.))
+            .bg(theme::black(0.22))
+            .text_size(px(11.5))
             .text_color(theme::text_muted())
-            .children(facts.map(|facts| {
-                div()
-                    .flex_none()
-                    .font(theme::numeric(FontWeight::NORMAL))
-                    .text_size(px(11.))
-                    .child(facts)
-            }))
+            .children(peak)
             .child(
                 div()
                     .flex_1()
@@ -576,11 +990,18 @@ impl Sonora {
                     .items_center()
                     .justify_end()
                     .gap(px(10.))
-                    .child(self.render_status(compact, cx)),
+                    .child(self.render_status(cx)),
+            )
+            .child(
+                icon_button("help", true, self.help)
+                    .size(px(22.))
+                    .tooltip(tooltip("Keyboard & gestures", Some("?")))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_help(cx)))
+                    .child(icon("icons/help.svg", 14., icon_ink(true, self.help))),
             )
     }
 
-    fn render_status(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_status(&self, cx: &mut Context<Self>) -> AnyElement {
         let doc = self.doc();
 
         if let Some(job) = doc.and_then(|d| d.export.as_ref()) {
@@ -595,25 +1016,14 @@ impl Sonora {
                         .child(if cancelling {
                             "Cancelling…".to_string()
                         } else {
-                            format!("Exporting {}", display_name(&job.destination))
+                            format!(
+                                "Exporting {} · {}",
+                                job.format.label(),
+                                display_name(&job.destination)
+                            )
                         }),
                 )
-                .child(progress_bar(fraction, 88.))
-                .child(
-                    div()
-                        .w(px(30.))
-                        .flex_none()
-                        .font(theme::numeric(FontWeight::NORMAL))
-                        .child(format!("{}%", (fraction * 100.0).floor() as u32)),
-                )
-                .when(!cancelling, |row| {
-                    row.child(
-                        link_button("cancel-export", theme::text())
-                            .tooltip(tooltip("Stop exporting", Some("Esc")))
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
-                            .child("Cancel"),
-                    )
-                })
+                .child(progress_bar(fraction, 96.))
                 .into_any_element();
         }
 
@@ -633,9 +1043,15 @@ impl Sonora {
                 .child(icon("icons/close.svg", 11., theme::text_muted()));
             return match notice {
                 Notice::Error(message) => status_row()
-                    .text_color(theme::coral(0.95))
-                    .child(icon("icons/warning.svg", 12., theme::coral(0.95)))
-                    .child(div().min_w_0().truncate().child(message.clone()))
+                    .text_color(theme::text())
+                    .child(icon("icons/warning.svg", 13., theme::white(1.0)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(message.clone()),
+                    )
                     .child(dismiss)
                     .into_any_element(),
                 Notice::Info(message) => status_row()
@@ -645,7 +1061,7 @@ impl Sonora {
                 Notice::Saved(path) => {
                     let path = path.clone();
                     status_row()
-                        .child(icon("icons/check.svg", 12., theme::accent(1.0)))
+                        .child(icon("icons/check.svg", 13., theme::white(1.0)))
                         .child(
                             div()
                                 .min_w_0()
@@ -654,7 +1070,7 @@ impl Sonora {
                                 .child(format!("Saved {}", display_name(&path))),
                         )
                         .child(
-                            link_button("reveal", theme::accent(1.0))
+                            link_button("reveal", theme::text())
                                 .tooltip(tooltip("Reveal the exported file in Finder", None))
                                 .on_click(move |_, _, _| audio::reveal(&path))
                                 .child("Show in Finder"),
@@ -672,36 +1088,88 @@ impl Sonora {
             let label = if doc.peaks.is_none() {
                 "Reading waveform…".to_string()
             } else if doc.wave_progress <= 0.0 {
-                "Quick preview · scanning…".to_string()
+                "Quick overview · scanning…".to_string()
             } else {
                 format!(
-                    "Preview · refining {}%",
+                    "Refining overview · {}%",
                     (doc.wave_progress * 100.0).floor() as u32
                 )
             };
             return status_row()
-                .child(div().min_w_0().truncate().child(label))
-                .child(progress_bar(doc.wave_progress, 56.))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme::text_faint())
+                        .child(label),
+                )
+                .child(progress_bar(doc.wave_progress, 64.))
                 .into_any_element();
         }
 
-        let hints = if doc.is_some() {
-            if compact {
-                vec![hint("Space", "Play"), hint("I O", "Trim")]
+        if matches!(self.phase, Phase::Empty) {
+            return status_row()
+                .text_color(theme::text_faint())
+                .child("Open")
+                .child(keycap("⌘O"))
+                .into_any_element();
+        }
+        div().into_any_element()
+    }
+}
+
+// ---- Pieces --------------------------------------------------------------
+
+/// Which secondary transport pieces fit at a given window width. Measured
+/// widths (tracked caps, timecodes) were rounded up so the essentials — play,
+/// loop, clock, gain value, format picker and the full "Export WAV" button —
+/// always fit, down to the 640 px minimum window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TransportFold {
+    /// Width of the gain slider, if shown.
+    slider: Option<f32>,
+    to_start: bool,
+    gain_label: bool,
+    ab: bool,
+    /// Plain (untracked) format labels with less padding.
+    tight_formats: bool,
+}
+
+impl TransportFold {
+    fn for_width(width: f32) -> Self {
+        Self {
+            slider: if width >= 820.0 {
+                Some(120.)
+            } else if width >= 780.0 {
+                Some(88.)
             } else {
-                vec![
-                    hint("Space", "Play"),
-                    hint("I O", "Trim at playhead"),
-                    hint("← →", "Seek"),
-                    hint("⇧⌘S", "Export"),
-                ]
-            }
-        } else if matches!(self.phase, Phase::Empty) {
-            vec![hint("⌘O", "Open"), hint("Drop", "Any audio file")]
-        } else {
-            vec![]
-        };
-        status_row().gap(px(14.)).children(hints).into_any_element()
+                None
+            },
+            to_start: width >= 870.0,
+            gain_label: width >= 920.0,
+            ab: width >= 700.0,
+            tight_formats: width < 700.0,
+        }
+    }
+
+    /// A conservative estimate of the row's width with these pieces.
+    #[cfg(test)]
+    fn estimate(&self) -> f32 {
+        // Padding, play, loop, spacer, clock, gain readout, clip badge,
+        // rule, Export, and the gaps between them.
+        let mut total = 32. + 40. + 28. + 4. + 92. + 62. + 14. + 1. + 120. + 86.;
+        total += if self.tight_formats { 120. } else { 150. };
+        total += self.slider.map_or(0., |w| w + 8.);
+        if self.ab {
+            total += 46. + 8.;
+        }
+        if self.to_start {
+            total += 28. + 10.;
+        }
+        if self.gain_label {
+            total += 32. + 8.;
+        }
+        total
     }
 }
 
@@ -715,47 +1183,119 @@ fn status_row() -> Div {
         .overflow_hidden()
 }
 
-fn drop_zone() -> Div {
+fn separator_dot() -> Div {
+    div().size(px(3.)).rounded_full().bg(theme::white(0.25))
+}
+
+fn vertical_rule() -> Div {
+    div().flex_none().w(px(1.)).h(px(22.)).bg(theme::hairline())
+}
+
+/// The empty / opening stage: a fading dot field behind centered content.
+fn field_zone() -> Div {
     div()
+        .relative()
         .flex_1()
         .min_h_0()
-        .mb(px(14.))
-        .rounded(px(14.))
+        .mb(px(12.))
+        .rounded(px(12.))
         .border_1()
-        .border_color(theme::ivory(0.06))
-        .bg(theme::ivory(0.015))
+        .border_color(theme::hairline())
+        .bg(theme::well())
+        .overflow_hidden()
         .flex()
         .flex_col()
         .items_center()
         .justify_center()
         .px(px(24.))
+        .child(wave::dot_field())
 }
 
-/// A decorative mark: five seafoam bars in a soft disc.
-fn glyph(strength: f32) -> impl IntoElement {
+fn trim_chip(id: &'static str, label: &'static str, time: f64) -> Stateful<Div> {
     div()
-        .size(px(64.))
-        .rounded_full()
-        .bg(theme::accent(0.09 * strength))
-        .border_1()
-        .border_color(theme::accent(0.22 * strength))
+        .id(id)
+        .flex_none()
+        .h(px(28.))
+        .px(px(8.))
+        .rounded(px(7.))
+        .flex()
+        .items_center()
+        .gap(px(7.))
+        .whitespace_nowrap()
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::white(0.07)))
+        .active(|s| s.bg(theme::white(0.12)))
+        .child(caps(label, 8.5, theme::text_faint()))
+        .child(
+            div()
+                .font(theme::numeric(FontWeight::MEDIUM))
+                .text_size(px(12.5))
+                .text_color(theme::text())
+                .child(theme::timecode(time)),
+        )
+}
+
+fn ab_letter(letter: &'static str, on: bool) -> Div {
+    div()
+        .size(px(18.))
         .flex()
         .items_center()
         .justify_center()
-        .gap(px(3.))
-        .children([12., 22., 32., 20., 10.].map(|h| {
+        .rounded(px(5.))
+        .font_weight(FontWeight::BOLD)
+        .text_size(px(10.5))
+        .map(|el| {
+            if on {
+                el.bg(theme::white(0.94)).text_color(theme::black(0.92))
+            } else {
+                el.text_color(theme::text_faint())
+            }
+        })
+        .child(letter)
+}
+
+fn progress_bar(fraction: f32, width: f32) -> impl IntoElement {
+    let fraction = fraction.clamp(0.0, 1.0);
+    div()
+        .flex_none()
+        .w(px(width))
+        .h(px(3.))
+        .rounded(px(1.5))
+        .bg(theme::white(0.12))
+        .child(
             div()
-                .w(px(3.))
-                .h(px(h))
+                .h_full()
+                .w(px(width * fraction))
                 .rounded(px(1.5))
-                .bg(theme::accent(0.9 * strength))
-        }))
+                .bg(theme::white(0.95)),
+        )
+}
+
+fn clip_badge(clip: Clip) -> impl IntoElement {
+    let (label, alpha) = match clip {
+        Clip::None => return div().w(px(14.)).flex_none().into_any_element(),
+        Clip::Possible => ("Gain above 0 dB may clip once peaks are measured", 0.45),
+        Clip::Likely => (
+            "The quick overview suggests peaks will clip; export hard-limits them",
+            0.9,
+        ),
+        Clip::Certain => (
+            "Peaks will clip — export hard-limits samples to full scale",
+            1.0,
+        ),
+    };
+    div()
+        .id("clip")
+        .flex_none()
+        .tooltip(tooltip(label, None))
+        .child(icon("icons/warning.svg", 14., theme::white(alpha)))
+        .into_any_element()
 }
 
 /// Shown over a loaded document while a file is dragged over the window.
 /// GPUI only hit-tests an element with a listener, so the overlay takes the
 /// drop itself.
-fn drop_overlay(cx: &mut Context<Sonora>) -> impl IntoElement {
+fn drop_overlay(loaded: bool, cx: &mut Context<Sonora>) -> impl IntoElement {
     div()
         .id("drop-overlay")
         .absolute()
@@ -769,103 +1309,231 @@ fn drop_overlay(cx: &mut Context<Sonora>) -> impl IntoElement {
                 .size_full()
                 .rounded(px(14.))
                 .border_1()
-                .border_color(theme::accent(0.6))
-                .bg(theme::shade(0.62))
+                .border_color(theme::white(0.6))
+                .bg(theme::black(0.82))
                 .flex()
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap(px(12.))
-                .child(glyph(1.0))
+                .gap(px(14.))
+                .child(dot_glyph(
+                    &MARK_LARGE,
+                    6.,
+                    4.,
+                    theme::white(0.96),
+                    theme::white(0.07),
+                ))
                 .child(
                     div()
-                        .text_size(px(15.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .child("Release to open"),
+                        .text_size(px(16.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Release to open audio or video"),
                 )
                 .child(
                     div()
+                        .max_w(px(420.))
+                        .text_center()
                         .text_color(theme::text_muted())
-                        .child("The current file closes; nothing is saved over."),
+                        .child(if loaded {
+                            "From a video, its first audio track. The current file closes; \
+                             nothing is saved over."
+                        } else {
+                            "From a video, Sonora edits its first audio track."
+                        }),
                 ),
         )
 }
 
-fn trim_chip(id: &'static str, label: &'static str, time: f64) -> gpui::Stateful<Div> {
-    div()
-        .id(id)
-        .flex_none()
-        .h(px(38.))
-        .px(px(9.))
-        .rounded(px(8.))
-        .flex()
-        .flex_col()
-        .justify_center()
-        .whitespace_nowrap()
-        .cursor_pointer()
-        .hover(|s| s.bg(theme::ivory(0.06)))
-        .active(|s| s.bg(theme::ivory(0.10)))
+/// The stage while a file is probed or its audio extracted.
+fn render_opening(import: &Import, cx: &mut Context<Sonora>) -> impl IntoElement {
+    let caption = if import.video {
+        "Extracting audio from video"
+    } else {
+        "Opening"
+    };
+    field_zone()
+        .child(dot_glyph(
+            &MARK_LARGE,
+            6.,
+            4.,
+            theme::white(0.5),
+            theme::white(0.06),
+        ))
         .child(
             div()
-                .text_size(px(10.))
-                .text_color(theme::text_faint())
+                .mt(px(22.))
+                .max_w_full()
+                .truncate()
+                .text_size(px(15.))
                 .font_weight(FontWeight::MEDIUM)
-                .child(label),
+                .child(import.name.clone()),
         )
         .child(
             div()
-                .font(theme::numeric(FontWeight::NORMAL))
-                .text_size(px(12.5))
-                .text_color(theme::text())
-                .child(theme::timecode(time)),
+                .mt(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .child(caps(caption, 9.5, theme::text_faint()))
+                .child(scanner(import.started.elapsed().as_secs_f32())),
         )
-}
-
-fn progress_bar(fraction: f32, width: f32) -> impl IntoElement {
-    let fraction = fraction.clamp(0.0, 1.0);
-    div()
-        .flex_none()
-        .w(px(width))
-        .h(px(3.))
-        .rounded(px(1.5))
-        .bg(theme::ivory(0.10))
+        .when(import.video, |zone| {
+            zone.child(
+                div()
+                    .mt(px(10.))
+                    .text_color(theme::text_muted())
+                    .child("Sonora uses the first audio track. Only audio is exported."),
+            )
+        })
         .child(
-            div()
-                .h_full()
-                .w(px(width * fraction))
-                .rounded(px(1.5))
-                .bg(theme::accent(0.95)),
+            link_button("cancel-open", theme::text_muted())
+                .mt(px(18.))
+                .tooltip(tooltip("Stop opening this file", Some("Esc")))
+                .on_click(cx.listener(|this, _, _, cx| this.cancel_open(cx)))
+                .child("Cancel")
+                .child(keycap("Esc")),
         )
 }
 
-fn clip_badge(clip: Clip) -> impl IntoElement {
-    let (label, color) = match clip {
-        Clip::None => return div().w(px(14.)).flex_none().into_any_element(),
-        Clip::Possible => (
-            "Gain above 0 dB may clip once peaks are measured",
-            theme::amber(0.55),
-        ),
-        Clip::Likely => (
-            "The overview suggests peaks will clip; export hard-limits them",
-            theme::amber(0.95),
-        ),
-        Clip::Certain => (
-            "Peaks will clip — export hard-limits samples to full scale",
-            theme::amber(1.0),
-        ),
+/// An indeterminate progress line: a bright dot sweeping back and forth.
+fn scanner(seconds: f32) -> Div {
+    const DOTS: usize = 9;
+    let travel = (DOTS - 1) as f32;
+    let phase = (seconds * 7.0) % (travel * 2.0);
+    let head = if phase > travel {
+        travel * 2.0 - phase
+    } else {
+        phase
     };
     div()
-        .id("clip")
+        .flex()
         .flex_none()
-        .tooltip(tooltip(label, None))
-        .child(icon("icons/warning.svg", 14., color))
-        .into_any_element()
+        .items_center()
+        .gap(px(4.))
+        .children((0..DOTS).map(|i| {
+            let distance = (i as f32 - head).abs();
+            div()
+                .size(px(4.))
+                .rounded_full()
+                .bg(theme::white((1.0 - distance * 0.28).max(0.12)))
+        }))
+}
+
+/// The keyboard and gesture reference, toggled with `?`.
+fn help_sheet(cx: &mut Context<Sonora>) -> impl IntoElement {
+    const KEYS: &[(&str, &str)] = &[
+        ("Space", "Play / pause"),
+        ("L", "Loop selection"),
+        ("B", "A/B original level"),
+        ("I  O", "Start / end at playhead"),
+        ("⇧I  ⇧O", "Reset start / end"),
+        ("← →", "Seek 1 s  ·  ⇧ 5 s"),
+        ("⌥← →", "Nudge 10 ms"),
+        ("↑  ↓", "Selection start / end"),
+        ("+  −  0", "Gain up / down / 0 dB"),
+        ("Z  ⇧Z", "Zoom to selection / fit"),
+        ("⌘=  ⌘−", "Zoom in / out"),
+        ("⌘1 2 3", "WAV · MP3 · M4A"),
+        ("⌘Z  ⇧⌘Z", "Undo / redo"),
+        ("⇧⌘S", "Export"),
+    ];
+    const GESTURES: &[(&str, &str)] = &[
+        ("Click", "Move the playhead"),
+        ("Drag", "Select a range"),
+        ("Drag handle", "Trim one edge"),
+        ("Double-click handle", "Reset that edge"),
+        ("Double-click gain", "Back to 0 dB"),
+        ("Scroll", "Pan while zoomed"),
+        ("⌘ Scroll", "Zoom at the pointer"),
+        ("Overview strip", "Click or drag to jump"),
+    ];
+
+    let row = |keys: &'static str, label: &'static str| {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(12.))
+            .h(px(22.))
+            .child(div().text_color(theme::text_muted()).child(label))
+            .child(keycap(keys))
+    };
+    let column = |title: &'static str, rows: &'static [(&'static str, &'static str)]| {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(div().mb(px(8.)).child(caps(title, 9., theme::text_faint())))
+            .children(rows.iter().map(|(k, l)| row(k, l)))
+    };
+
+    div()
+        .id("help-sheet")
+        .absolute()
+        .inset_0()
+        .occlude()
+        .bg(theme::black(0.62))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                this.help = false;
+                cx.notify();
+            }),
+        )
+        .child(
+            div()
+                .id("help-panel")
+                .w(px(560.))
+                .max_w_full()
+                .mx(px(20.))
+                .p(px(22.))
+                .rounded(px(14.))
+                .bg(theme::panel())
+                .border_1()
+                .border_color(theme::white(0.12))
+                .text_size(px(12.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .mb(px(18.))
+                        .child(dot_glyph(
+                            &MARK_SMALL,
+                            2.,
+                            1.5,
+                            theme::white(0.95),
+                            theme::white(0.12),
+                        ))
+                        .child(caps("Keyboard & gestures", 10., theme::text()))
+                        .child(div().flex_1())
+                        .child(
+                            link_button("close-help", theme::text_muted())
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_help(cx)))
+                                .child("Close")
+                                .child(keycap("Esc")),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(28.))
+                        .child(column("Keys", KEYS))
+                        .child(column("Pointer", GESTURES)),
+                ),
+        )
 }
 
 /// Loudest absolute sample inside the selection, per the current overview.
 fn selection_peak(doc: &Document) -> Option<f32> {
     let peaks = doc.peaks.as_deref().filter(|p| !p.is_empty())?;
-    let duration = doc.info.duration().max(1e-9);
+    let duration = doc.duration().max(1e-9);
     let n = peaks.len();
     let b0 = ((doc.edit.start / duration) * n as f64)
         .floor()
@@ -905,5 +1573,33 @@ fn dbfs(amplitude: f32) -> String {
         format!("\u{2212}{:.1} dBFS", -rounded)
     } else {
         "0.0 dBFS".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransportFold;
+
+    #[test]
+    fn transport_fits_every_supported_width() {
+        // 640 is the minimum window; 841 is macOS "Move & Resize › Right".
+        for width in (640..=1400).step_by(1) {
+            let width = width as f32;
+            let fold = TransportFold::for_width(width);
+            assert!(
+                fold.estimate() <= width,
+                "{width}px needs {} for {fold:?}",
+                fold.estimate()
+            );
+        }
+    }
+
+    #[test]
+    fn half_screen_keeps_the_slider_and_drops_low_priority_pieces() {
+        let fold = TransportFold::for_width(841.0);
+        assert_eq!(fold.slider, Some(120.));
+        assert!(fold.ab && !fold.to_start && !fold.gain_label && !fold.tight_formats);
+        let full = TransportFold::for_width(940.0);
+        assert!(full.to_start && full.gain_label);
     }
 }

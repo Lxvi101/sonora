@@ -1,4 +1,5 @@
-//! Small shared pieces: icons, keycaps, tooltips and the button treatments.
+//! Small shared pieces: icons, keycaps, tooltips, buttons and the dotted
+//! brand glyph.
 
 use gpui::{
     AnyView, App, BoxShadow, Context, Div, FontWeight, Hsla, IntoElement, ParentElement, Render,
@@ -15,32 +16,35 @@ pub fn icon(name: &'static str, size: f32, color: Hsla) -> Svg {
         .text_color(color)
 }
 
+/// A letter-spaced caps label.
+pub fn caps(text: &str, size: f32, color: Hsla) -> Div {
+    div()
+        .flex_none()
+        .whitespace_nowrap()
+        .text_size(px(size))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(color)
+        .child(theme::tracked(text))
+}
+
 /// A quiet keycap for inline shortcut hints.
 pub fn keycap(keys: impl Into<SharedString>) -> Div {
     div()
         .flex_none()
+        .min_w(px(18.))
         .px(px(5.))
-        .h(px(17.))
+        .h(px(18.))
         .flex()
         .items_center()
+        .justify_center()
         .rounded(px(4.))
-        .bg(theme::ivory(0.07))
+        .bg(theme::white(0.06))
         .border_1()
-        .border_color(theme::ivory(0.06))
+        .border_color(theme::white(0.10))
+        .font(theme::numeric(FontWeight::MEDIUM))
         .text_size(px(10.5))
         .text_color(theme::text_muted())
         .child(keys.into())
-}
-
-/// A shortcut hint: keycap followed by what it does.
-pub fn hint(keys: &'static str, label: &'static str) -> Div {
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap(px(5.))
-        .child(keycap(keys))
-        .child(div().text_color(theme::text_faint()).child(label))
 }
 
 pub struct Tooltip {
@@ -55,17 +59,17 @@ impl Render for Tooltip {
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(9.))
                 .px(px(9.))
-                .py(px(5.))
-                .rounded(px(7.))
-                .bg(theme::shade(0.88))
+                .py(px(6.))
+                .rounded(px(6.))
+                .bg(theme::panel())
                 .border_1()
-                .border_color(theme::ivory(0.10))
+                .border_color(theme::white(0.14))
                 .shadow(vec![BoxShadow {
-                    color: theme::shade(0.35),
-                    offset: point(px(0.), px(4.)),
-                    blur_radius: px(14.),
+                    color: theme::black(0.6),
+                    offset: point(px(0.), px(6.)),
+                    blur_radius: px(18.),
                     spread_radius: px(0.),
                 }])
                 .font_family(theme::UI_FONT)
@@ -90,74 +94,93 @@ pub fn tooltip(
     }
 }
 
-/// The round seafoam transport button.
-pub fn round_button(id: &'static str, enabled: bool) -> Stateful<Div> {
+/// The white circular play button — the one solid shape in the transport.
+pub fn play_button(id: &'static str, enabled: bool) -> Stateful<Div> {
     let base = div()
         .id(id)
         .flex_none()
-        .size(px(36.))
+        .size(px(40.))
         .rounded_full()
         .flex()
         .items_center()
         .justify_center();
     if enabled {
-        base.bg(theme::accent(0.92))
-            .border_1()
-            .border_color(theme::accent(0.55))
+        base.bg(theme::white(0.96))
             .shadow(vec![BoxShadow {
-                color: theme::accent(0.22),
-                offset: point(px(0.), px(2.)),
-                blur_radius: px(12.),
+                color: theme::white(0.10),
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(16.),
                 spread_radius: px(0.),
             }])
             .cursor_pointer()
-            .hover(|s| s.bg(theme::accent(1.0)))
-            .active(|s| s.bg(theme::accent_strong()))
+            .hover(|s| s.bg(theme::white(1.0)))
+            .active(|s| s.bg(theme::white(0.80)))
     } else {
-        base.bg(theme::ivory(0.06))
+        base.bg(theme::white(0.06))
             .border_1()
-            .border_color(theme::ivory(0.05))
+            .border_color(theme::white(0.08))
     }
 }
 
-/// A translucent pill; `primary` tints it with the accent.
-pub fn pill_button(id: &'static str, primary: bool, enabled: bool) -> Stateful<Div> {
+/// A square icon button. `on` inverts it to white for engaged toggles.
+pub fn icon_button(id: &'static str, enabled: bool, on: bool) -> Stateful<Div> {
+    let base = div()
+        .id(id)
+        .flex_none()
+        .size(px(28.))
+        .rounded(px(7.))
+        .flex()
+        .items_center()
+        .justify_center();
+    match (enabled, on) {
+        (false, _) => base,
+        (true, true) => base
+            .bg(theme::white(0.94))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::white(1.0)))
+            .active(|s| s.bg(theme::white(0.78))),
+        (true, false) => base
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::white(0.08)))
+            .active(|s| s.bg(theme::white(0.13))),
+    }
+}
+
+/// Icon color to pair with [`icon_button`].
+pub fn icon_ink(enabled: bool, on: bool) -> Hsla {
+    match (enabled, on) {
+        (false, _) => theme::text_ghost(),
+        (true, true) => theme::black(0.92),
+        (true, false) => theme::text_muted(),
+    }
+}
+
+/// The solid white call to action (Export, Open).
+pub fn primary_button(id: &'static str, enabled: bool) -> Stateful<Div> {
     let base = div()
         .id(id)
         .flex_none()
         .h(px(30.))
-        .px(px(12.))
+        .px(px(14.))
         .flex()
         .items_center()
         .gap(px(7.))
-        .rounded(px(8.))
-        .border_1()
+        .rounded(px(15.))
         .text_size(px(12.5))
-        .font_weight(FontWeight::MEDIUM)
+        .font_weight(FontWeight::SEMIBOLD)
         .whitespace_nowrap();
-    match (primary, enabled) {
-        (_, false) => base
-            .bg(theme::ivory(0.03))
-            .border_color(theme::ivory(0.05))
-            .text_color(theme::text_faint()),
-        (true, true) => base
-            .bg(theme::accent(0.13))
-            .border_color(theme::accent(0.30))
-            .text_color(theme::accent(1.0))
+    if enabled {
+        base.bg(theme::white(0.96))
+            .text_color(theme::black(0.94))
             .cursor_pointer()
-            .hover(|s| s.bg(theme::accent(0.20)).border_color(theme::accent(0.45)))
-            .active(|s| s.bg(theme::accent(0.26))),
-        (false, true) => base
-            .bg(theme::ivory(0.06))
-            .border_color(theme::ivory(0.08))
-            .text_color(theme::text())
-            .cursor_pointer()
-            .hover(|s| s.bg(theme::ivory(0.10)))
-            .active(|s| s.bg(theme::ivory(0.13))),
+            .hover(|s| s.bg(theme::white(1.0)))
+            .active(|s| s.bg(theme::white(0.80)))
+    } else {
+        base.bg(theme::white(0.08)).text_color(theme::text_faint())
     }
 }
 
-/// An inline text action, used in the footer.
+/// An inline text action, used in the status line.
 pub fn link_button(id: &'static str, color: Hsla) -> Stateful<Div> {
     div()
         .id(id)
@@ -171,6 +194,35 @@ pub fn link_button(id: &'static str, color: Hsla) -> Stateful<Div> {
         .text_color(color)
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
-        .hover(|s| s.bg(theme::ivory(0.07)))
-        .active(|s| s.bg(theme::ivory(0.11)))
+        .hover(|s| s.bg(theme::white(0.08)))
+        .active(|s| s.bg(theme::white(0.13)))
 }
+
+/// The Sonora mark: a waveform drawn as columns of dots on a dot matrix.
+/// `heights` are lit dots per column (odd numbers keep it centered).
+pub fn dot_glyph(heights: &[u8], dot: f32, gap: f32, lit: Hsla, unlit: Hsla) -> Div {
+    let rows = heights.iter().copied().max().unwrap_or(1) as usize;
+    div()
+        .flex()
+        .flex_none()
+        .gap(px(gap))
+        .children(heights.iter().map(|&h| {
+            let pad = (rows - h as usize) / 2;
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(gap))
+                .children((0..rows).map(move |row| {
+                    let on = row >= pad && row < pad + h as usize;
+                    div()
+                        .size(px(dot))
+                        .rounded_full()
+                        .bg(if on { lit } else { unlit })
+                }))
+        }))
+}
+
+/// The small mark in the titlebar.
+pub const MARK_SMALL: [u8; 5] = [1, 3, 5, 3, 1];
+/// The large mark on the empty stage.
+pub const MARK_LARGE: [u8; 9] = [1, 3, 5, 9, 7, 9, 5, 3, 1];

@@ -1,59 +1,57 @@
-//! Sonora's palette and type: smoky translucent charcoal, warm ivory ink and a
-//! single restrained seafoam accent. Amber is reserved for clipping, coral for
-//! errors.
+//! Sonora's palette and type. Strictly achromatic: matte near-black surfaces,
+//! pure white ink and a few neutral greys. Emphasis comes from luminance,
+//! weight and the dot matrix — never from hue.
 
 use std::sync::Arc;
 
 use gpui::{Font, FontFeatures, FontStyle, FontWeight, Hsla, hsla};
 
-/// The window surface laid over the macOS blur.
+pub fn white(alpha: f32) -> Hsla {
+    hsla(0., 0., 1., alpha)
+}
+
+pub fn black(alpha: f32) -> Hsla {
+    hsla(0., 0., 0., alpha)
+}
+
+/// The window body: a rich, almost opaque black over the system blur.
 pub fn surface() -> Hsla {
-    hsla(30. / 360., 0.06, 0.085, 0.70)
+    hsla(0., 0., 0.043, 0.965)
 }
 
-/// A recessed well (the waveform stage) sunk into the surface.
+/// Translucent black chrome for the titlebar strip.
+pub fn chrome() -> Hsla {
+    black(0.38)
+}
+
+/// The waveform well, a step deeper than the body.
 pub fn well() -> Hsla {
-    hsla(30. / 360., 0.08, 0.04, 0.30)
+    hsla(0., 0., 0.012, 0.92)
 }
 
-pub fn ivory(alpha: f32) -> Hsla {
-    hsla(40. / 360., 0.42, 0.93, alpha)
+/// Raised panels: tooltips, the help sheet.
+pub fn panel() -> Hsla {
+    hsla(0., 0., 0.075, 0.985)
 }
 
 pub fn text() -> Hsla {
-    ivory(0.92)
+    white(0.94)
 }
 
 pub fn text_muted() -> Hsla {
-    ivory(0.70)
+    white(0.62)
 }
 
 pub fn text_faint() -> Hsla {
-    ivory(0.54)
+    white(0.44)
+}
+
+pub fn text_ghost() -> Hsla {
+    white(0.26)
 }
 
 pub fn hairline() -> Hsla {
-    ivory(0.075)
-}
-
-pub fn accent(alpha: f32) -> Hsla {
-    hsla(158. / 360., 0.50, 0.72, alpha)
-}
-
-pub fn accent_strong() -> Hsla {
-    hsla(160. / 360., 0.46, 0.64, 1.0)
-}
-
-pub fn amber(alpha: f32) -> Hsla {
-    hsla(36. / 360., 0.90, 0.64, alpha)
-}
-
-pub fn coral(alpha: f32) -> Hsla {
-    hsla(8. / 360., 0.80, 0.71, alpha)
-}
-
-pub fn shade(alpha: f32) -> Hsla {
-    hsla(30. / 360., 0.10, 0.02, alpha)
+    white(0.085)
 }
 
 pub const UI_FONT: &str = ".SystemUIFont";
@@ -69,6 +67,21 @@ pub fn numeric(weight: FontWeight) -> Font {
     }
 }
 
+/// Letter-spaced small caps for labels: hair spaces between letters, a
+/// wider gap between words.
+pub fn tracked(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 4);
+    for (i, ch) in text.chars().enumerate() {
+        if i > 0 {
+            out.push(if ch == ' ' { '\u{2002}' } else { '\u{200A}' });
+        }
+        if ch != ' ' {
+            out.extend(ch.to_uppercase());
+        }
+    }
+    out
+}
+
 /// `m:ss.cc`, or `h:mm:ss.cc` past an hour.
 pub fn timecode(seconds: f64) -> String {
     let centis = (seconds.max(0.0) * 100.0).round() as u64;
@@ -82,10 +95,14 @@ pub fn timecode(seconds: f64) -> String {
     }
 }
 
-/// A coarse `m:ss` label for ruler ticks.
+/// A coarse label for ruler ticks; finer steps show more decimals.
 pub fn tick_label(seconds: f64, step: f64) -> String {
     let total = seconds.max(0.0);
-    if step < 1.0 {
+    if step < 0.1 {
+        let whole = total.floor() as u64;
+        let centis = ((total - whole as f64) * 100.0).round() as u64 % 100;
+        format!("{}:{:02}.{:02}", whole / 60, whole % 60, centis)
+    } else if step < 1.0 {
         let whole = total.floor() as u64;
         let tenths = ((total - whole as f64) * 10.0).round() as u64 % 10;
         format!("{}:{:02}.{}", whole / 60, whole % 60, tenths)
@@ -129,6 +146,6 @@ pub fn channels(count: u32) -> String {
     match count {
         1 => "Mono".into(),
         2 => "Stereo".into(),
-        n => format!("{n} channels"),
+        n => format!("{n} ch"),
     }
 }

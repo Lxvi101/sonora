@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
     std::thread::sleep(Duration::from_millis(150));
     player.pause();
     let pos = player.position();
-    assert!(pos >= 7200. && pos < 7201.);
+    assert!((7200. ..7201.).contains(&pos));
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(pos, player.position());
     assert!(!player.is_playing());

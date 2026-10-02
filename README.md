@@ -1,6 +1,6 @@
 # Sonora
 
-A small, native macOS audio editor: open a recording, trim it, adjust its volume, preview, and export a new file. Rust + GPUI, rendered with Metal. Native macOS glass, file dialogs, audio decoding and playback. No browser, server, account, or network connection at runtime.
+A small, native macOS audio editor: drop an audio recording or video, trim its audio, adjust its volume, preview, and export a new audio file. Rust + GPUI, rendered with Metal. A monochrome dot-matrix interface, native macOS file dialogs, audio decoding and playback. No browser, server, account, or network connection at runtime.
 
 The complete interface and icon were authored through **Claude Code using `claude-opus-5-5`**, as requested. The independent audio engine uses Apple's AVAudioEngine and AudioToolbox through a small Objective-C bridge. Zeron was a visual and architectural reference; its source is not bundled or copied.
 
@@ -16,23 +16,40 @@ open dist/Sonora.app
 
 Dependencies are pinned in `Cargo.lock`. On a fresh machine, run `cargo fetch --locked` first; the bundle script builds offline. The `runtime_shaders` GPUI feature avoids requiring a full Xcode installation. Metal compiles shaders at runtime, so first launch can cost more than later launches.
 
-To install in your user Applications folder, run `./scripts/install.sh` (it refuses to replace an existing installation).
+To install in your user Applications folder, run `./scripts/install.sh`. For an update, close Sonora and run `./scripts/install.sh --replace`; the previous bundle is backed up under `target/install-backup/`.
 
 The app bundle declares common audio types for Finder's **Open With** menu. To make double-click opening permanent, use Finder → Get Info on an audio file → Open with → Sonora → Change All. Repeat for the formats you use. This is an ordinary editor window, not a Quick Look extension replacing the Space-bar preview.
 
 ## Editing
 
-- Open with ⌘O, drop an audio file, or use Finder's Open With.
-- Drag waveform trim handles to keep a range. Click to seek.
-- Space plays or pauses the selected range. I and O set its start and end at the playhead.
-- Left/right seek one second; Shift-left/right seek five seconds; Option-left/right seek 10 milliseconds for precise I/O marks.
-- Adjust gain from −24 to +24 dB. `+` / `−` change it, and `0` resets it.
-- ⌘Z / ⇧⌘Z undo and redo edits. ⌘A selects the whole recording.
-- ⇧⌘S exports a new 24-bit PCM WAV at the original sample rate and channel count.
+- **Drop audio or video anywhere in the window**, including over an existing recording. MP4, MOV and M4V imports use the first audio track, starting at that track's beginning. Files with no readable audio show an error. Exports contain audio only; the source video is unchanged.
+- **Drag an edge** to trim. **Double-click the left edge** to reset its start to zero; **double-click the right edge** to reset its end to the full recording. The other edge and gain stay unchanged; undo restores the prior edge.
+- **Click the waveform** to seek; **drag across it** to select a range.
+- **Space** previews/pauses. The transport also offers return-to-start and loop selection (**L**).
+- **Original / Edited** (**B**) compares the gain change while listening. This only changes preview gain; the exported edit is unchanged, and the selected trim still applies.
+- **Z** zooms to the selection; **Shift-Z** or **⌘0** fits the whole file. The overview is limited to 32× zoom because its resolution is finite.
+- **I / O** set the start/end at the playhead; **Shift-I / Shift-O** restore those edges.
+- **Left/right** seek 1 second; **Shift-left/right** seek 5 seconds; **Option-left/right** seek 10 milliseconds.
+- Gain spans **−24 to +24 dB**. **+ / −** nudge it; **0** or a **double-click on the gain slider** resets it.
+- **⌘Z / ⇧⌘Z** undo/redo. **⌘A** keeps the full recording; **⌘⌫** resets trim and gain.
+- Choose **WAV / MP3 / M4A** before exporting (**⌘1 / ⌘2 / ⌘3**). **⇧⌘S** opens the native save dialog with the selected extension. The format choice persists while opening other files during the session.
+- **?** opens the control guide. **⌘O** opens a file; **⌘W** closes it.
 
-The source is never modified. Existing output files are refused, even if the native save panel offers Replace: choose a fresh name. Gain above available headroom hard-clips at full scale; this is not a limiter or loudness-normalization tool. WAV exports above the RIFF 4 GB limit are rejected; export a shorter selection.
+### Export formats
 
-Opening/decoding supports the audio formats available through the installed macOS codecs, including WAV, AIFF, MP3, M4A/AAC, CAF and FLAC. WAV, M4A and AIFF were exercised locally. This first version exports WAV only.
+| Format | Encoding | Channels and sample rate |
+| --- | --- | --- |
+| WAV | Lossless, 24-bit PCM | Original channel count and sample rate |
+| MP3 | LAME, 192 kbps | Mono/stereo; 32, 44.1 or 48 kHz |
+| M4A | Apple AAC, 192 kbps target | Mono/stereo; 44.1 or 48 kHz |
+
+Compressed exports resample when necessary and may contain codec priming/padding, which players account for differently. Actual AAC bitrate can vary with the audio. MP3 uses a bundled, dynamically linked LAME encoder built from the included source; M4A uses Apple's system encoder. **Neither requires FFmpeg, Homebrew, or a network connection.** The LAME library, license and corresponding source are included in the app; see `vendor/README.md`.
+
+The source is never modified. Existing output files are refused: choose a fresh name. Gain above available headroom hard-clips at full scale; this is not a limiter or loudness-normalization tool. WAV exports above the RIFF 4 GB limit are rejected; export a shorter selection or choose a compressed format. Use WAV for audio with more than two channels.
+
+Opening supports the audio formats available through the installed macOS codecs, including WAV, AIFF, MP3, M4A/AAC, CAF and FLAC. WAV, MP3, M4A and AIFF were exercised locally.
+
+Video import uses AVFoundation. AAC/ALAC soundtracks are copied into a private M4A without re-encoding when supported. Other supported soundtracks are decoded to a lossless float CAF on a background worker with bounded buffers. This fallback needs temporary disk space proportional to audio duration; it never decodes video frames. Backing files remain alive while waveform or export jobs need them and are removed after the last owner releases them. MKV/WebM and codecs absent from macOS are not guaranteed. Multiple soundtrack selection and video output are not included.
 
 ## Performance design
 
@@ -47,17 +64,23 @@ Opening/decoding supports the audio formats available through the installed macO
 
 ## Verification
 
+All 36 tests pass, along with formatting and all-target Clippy. The redesigned window's mouse controls, edge resets, gain reset, A/B, loop playback, zoom and native MP3/M4A exports were exercised. Keyboard playback, format selection and Undo were checked, along with cold and warm Launch Services video opening, no-audio errors, and a trimmed/amplified MP3 export from MOV. The installed app's 841-pixel tiled layout was checked with positive gain and the full format/export controls visible. Cross-application dragging could not be completed by the automation tool; the whole-window drop handler is implemented but the physical Finder-to-window gesture remains a manual verification item.
+
 ```sh
-cargo test --lib --locked --offline
+cargo test --locked --offline
 cargo run --release --example benchmark -- /path/to/recording.wav
 # Run only with a silent file longer than two hours:
 cargo run --release --example playback_check -- /path/to/silent.wav
 ```
 
-Eight engine tests cover native decoding, exact trim/gain round trips, clipping, invalid edits, WAV sizing, cancelled-export cleanup, source preservation, cached waveforms and multi-hour metadata access. The silent playback check verifies output scheduling, seeking, selection completion, pause/resume and gain changes against Core Audio.
+Twelve engine tests cover native decoding, exact trim/gain round trips, clipping, invalid edits, WAV sizing, cancelled-export cleanup, source preservation, cached waveforms, multi-hour metadata access, real MP3/AAC round trips, mono resampling, compressed-export cancellation and multichannel rejection. UI logic tests additionally cover edge resets, zoom mappings, format extensions and preview-gain independence. The silent playback check verifies output scheduling, seeking, selection completion, pause/resume and gain changes against Core Audio.
 
 Local engine-only measurements on a synthetic sparse three-hour, 48 kHz stereo 24-bit WAV (3.11 GB logical size): metadata **6.1 ms**, first sparse waveform update **0.47 ms**, exact waveform **5.51 s**, maximum resident size **12.0 MB**. Cached waveform lookup **0.20 ms**. A generated three-hour AAC/M4A (32 kHz stereo, silence) opened metadata in **49 ms**, produced its first sparse update in **37 ms**, and completed its exact scan in **4.28 s**, with **17.4 MB** maximum resident size. These are not whole-app startup/RAM figures or guarantees for compressed files, slower disks, network storage, or uncached physical data.
 
-The actual application was also exercised through its native window: Finder opening while already running, both trim handles, gain adjustment, playback/pause, menu Undo, and a native save-panel export. The 24-bit export was compared against the source and matched the selected samples and +6.1 dB gain within 0.000001 amplitude. A three-hour M4A opened in the UI with bounded memory (about 111 MiB RSS in the observed session). Drag-and-drop is implemented but was not exercised by automation. GPUI 0.2.2 does not expose the custom controls to VoiceOver; keyboard controls and tooltips are provided.
+The original application was exercised through its native window: Finder opening while already running, both trim handles, gain adjustment, playback/pause, menu Undo, and a native save-panel export. The 24-bit export was compared against the source and matched the selected samples and +6.1 dB gain within 0.000001 amplitude. A three-hour M4A opened in the UI with bounded memory (about 111 MiB RSS in the observed session). Drag-and-drop is implemented but was not exercised by automation. GPUI 0.2.2 does not expose the custom controls to VoiceOver; keyboard controls and tooltips are provided.
+
+Export verification: a two-second fixture was independently inspected with ffprobe and identified as PCM24 WAV, 192 kbps MP3, and AAC in an M4A container. FFmpeg is used only for verification, never by the app.
+
+Video tests cover AAC-in-MP4 and PCM-in-MOV import, trimmed WAV export, source preservation, shared backing-file lifetime, cleanup, cancellation and missing audio. A synthetic three-hour MP4 with a small silent AAC soundtrack imported in **531 ms** in a release engine check; a repeat took **530 ms** with **27 MB** maximum resident size. This measures audio extraction and metadata, not window startup or waveform completion; import time depends on soundtrack size and codecs.
 
 The bundle is locally ad-hoc signed, not Developer ID signed or notarized for public distribution.

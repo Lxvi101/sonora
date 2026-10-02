@@ -6,43 +6,33 @@ use gpui::{AssetSource, Result, SharedString};
 
 pub struct Assets;
 
-const FILES: &[(&str, &[u8])] = &[
-    (
-        "icons/play.svg",
-        include_bytes!("../../assets/icons/play.svg"),
-    ),
-    (
-        "icons/pause.svg",
-        include_bytes!("../../assets/icons/pause.svg"),
-    ),
-    (
-        "icons/open.svg",
-        include_bytes!("../../assets/icons/open.svg"),
-    ),
-    (
-        "icons/export.svg",
-        include_bytes!("../../assets/icons/export.svg"),
-    ),
-    (
-        "icons/volume.svg",
-        include_bytes!("../../assets/icons/volume.svg"),
-    ),
-    (
-        "icons/check.svg",
-        include_bytes!("../../assets/icons/check.svg"),
-    ),
-    (
-        "icons/warning.svg",
-        include_bytes!("../../assets/icons/warning.svg"),
-    ),
-    (
-        "icons/close.svg",
-        include_bytes!("../../assets/icons/close.svg"),
-    ),
-    (
-        "icons/reset.svg",
-        include_bytes!("../../assets/icons/reset.svg"),
-    ),
+macro_rules! icons {
+    ($($name:literal),* $(,)?) => {
+        &[$((
+            concat!("icons/", $name, ".svg"),
+            include_bytes!(concat!("../../assets/icons/", $name, ".svg")),
+        )),*]
+    };
+}
+
+const FILES: &[(&str, &[u8])] = icons![
+    "play",
+    "pause",
+    "to-start",
+    "loop",
+    "undo",
+    "redo",
+    "reset",
+    "zoom-in",
+    "zoom-out",
+    "zoom-selection",
+    "zoom-fit",
+    "open",
+    "export",
+    "check",
+    "warning",
+    "close",
+    "help",
 ];
 
 impl AssetSource for Assets {

@@ -149,3 +149,93 @@ void sonora_apply_vibrancy(void) {
         fix_glass(window.contentView.superview ?: window.contentView);
     }
 }
+
+// Streaming compressed export. These writers never retain an entire recording.
+#include <lame/lame.h>
+#include <unistd.h>
+typedef struct {
+    int kind;
+    uint32_t channels;
+    ExtAudioFileRef aac;
+    lame_t mp3;
+    FILE *file;
+    unsigned char encoded[65536];
+} SonoraWriter;
+
+void *sonora_writer_open(const char *path, int kind, double rate, uint32_t channels, uint64_t frames, char *err, size_t cap) {
+    @autoreleasepool {
+        if (channels < 1 || channels > 2) { error_text(err, cap, @"MP3 and M4A support mono or stereo. Use WAV for multichannel audio."); return NULL; }
+        SonoraWriter *w = calloc(1, sizeof(*w)); w->kind = kind; w->channels = channels;
+        if (kind == 1) {
+            w->mp3 = lame_init();
+            int output_rate = rate >= 48000 ? 48000 : (rate >= 44100 ? 44100 : 32000);
+            if (!w->mp3 || lame_set_in_samplerate(w->mp3, (int)llround(rate)) < 0 ||
+                lame_set_out_samplerate(w->mp3, output_rate) < 0 ||
+                lame_set_num_channels(w->mp3, channels) < 0 ||
+                lame_set_num_samples(w->mp3, (unsigned long)frames) < 0 ||
+                lame_set_brate(w->mp3, 192) < 0 || lame_set_quality(w->mp3, 2) < 0 ||
+                lame_set_bWriteVbrTag(w->mp3, 1) < 0 || lame_init_params(w->mp3) < 0) {
+                error_text(err, cap, @"Could not initialize MP3 encoding for this recording.");
+                if (w->mp3) lame_close(w->mp3); free(w); return NULL;
+            }
+            // Rust creates this file exclusively before calling us.
+            w->file = fopen(path, "r+b");
+            if (!w->file) { error_text(err, cap, @"Could not open the temporary export file."); lame_close(w->mp3); free(w); return NULL; }
+        } else if (kind == 2) {
+            AudioStreamBasicDescription output = {0};
+            // 192 kbps AAC is supported for mono and stereo at these rates.
+            output.mSampleRate = rate >= 48000 ? 48000 : 44100;
+            output.mFormatID = kAudioFormatMPEG4AAC;
+            output.mChannelsPerFrame = channels;
+            UInt32 size = sizeof(output);
+            OSStatus status = AudioFormatGetProperty(kAudioFormatProperty_FormatInfo, 0, NULL, &size, &output);
+            NSURL *url = [NSURL fileURLWithFileSystemRepresentation:path isDirectory:NO relativeToURL:nil];
+            if (!status) status = ExtAudioFileCreateWithURL((__bridge CFURLRef)url, kAudioFileM4AType, &output, NULL, kAudioFileFlags_EraseFile, &w->aac);
+            AudioStreamBasicDescription client = { .mSampleRate = rate, .mFormatID = kAudioFormatLinearPCM, .mFormatFlags = kAudioFormatFlagsNativeFloatPacked, .mBytesPerPacket = channels * 4, .mFramesPerPacket = 1, .mBytesPerFrame = channels * 4, .mChannelsPerFrame = channels, .mBitsPerChannel = 32 };
+            if (!status) status = ExtAudioFileSetProperty(w->aac, kExtAudioFileProperty_ClientDataFormat, sizeof(client), &client);
+            AudioConverterRef converter = NULL;
+            size = sizeof(converter);
+            if (!status) status = ExtAudioFileGetProperty(w->aac, kExtAudioFileProperty_AudioConverter, &size, &converter);
+            UInt32 bitrate = 192000;
+            if (!status) status = AudioConverterSetProperty(converter, kAudioConverterEncodeBitRate, sizeof(bitrate), &bitrate);
+            CFArrayRef config = NULL;
+            if (!status) status = ExtAudioFileSetProperty(w->aac, kExtAudioFileProperty_ConverterConfig, sizeof(config), &config);
+            if (status) {
+                error_text(err, cap, [NSString stringWithFormat:@"M4A encoder unavailable (audio error %d).", (int)status]);
+                if (w->aac) ExtAudioFileDispose(w->aac); free(w); return NULL;
+            }
+        } else { free(w); error_text(err, cap, @"Unknown output format."); return NULL; }
+        return w;
+    }
+}
+int sonora_writer_write(void *ptr, const float *samples, uint32_t frames) {
+    SonoraWriter *w = ptr;
+    if (w->kind == 1) {
+        int bytes = w->channels == 1
+            ? lame_encode_buffer_ieee_float(w->mp3, samples, samples, (int)frames, w->encoded, sizeof(w->encoded))
+            : lame_encode_buffer_interleaved_ieee_float(w->mp3, samples, (int)frames, w->encoded, sizeof(w->encoded));
+        if (bytes < 0) return bytes;
+        return fwrite(w->encoded, 1, bytes, w->file) == (size_t)bytes ? 0 : -1;
+    }
+    AudioBufferList buffers = { .mNumberBuffers = 1, .mBuffers = {{ .mNumberChannels = w->channels, .mDataByteSize = frames * w->channels * 4, .mData = (void *)samples }} };
+    return ExtAudioFileWrite(w->aac, frames, &buffers);
+}
+int sonora_writer_close(void *ptr, int finish) {
+    SonoraWriter *w = ptr; int status = 0;
+    if (w->kind == 1) {
+        if (finish) {
+            int bytes = lame_encode_flush(w->mp3, w->encoded, sizeof(w->encoded));
+            if (bytes < 0 || fwrite(w->encoded, 1, bytes, w->file) != (size_t)bytes) status = -1;
+            if (!status) {
+                size_t tag = lame_get_lametag_frame(w->mp3, w->encoded, sizeof(w->encoded));
+                if (tag > sizeof(w->encoded) || fseek(w->file, 0, SEEK_SET) != 0 || fwrite(w->encoded, 1, tag, w->file) != tag) status = -1;
+            }
+            if (fflush(w->file) != 0 || fsync(fileno(w->file)) != 0) status = -1;
+        }
+        if (fclose(w->file) != 0) status = -1;
+        lame_close(w->mp3);
+    } else {
+        status = ExtAudioFileDispose(w->aac);
+    }
+    free(w); return status;
+}

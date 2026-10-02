@@ -1,0 +1,1 @@
+Synthetic test fixtures generated locally with FFmpeg: 32×32 black video, half a second, 4 fps, H.264. Audio fixtures contain a 440 Hz sine at 48 kHz mono, AAC in aac.mp4 and PCM16 in pcm.mov. no-audio.mp4 contains no audio. No third-party media. FFmpeg is not needed to run the tests or app.
