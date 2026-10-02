@@ -1,0 +1,12 @@
+name: Feature request
+description: Propose a focused improvement.
+body:
+  - type: textarea
+    attributes:
+      label: What task should become easier?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed behavior
+      description: Sonora focuses on quick audio edits rather than multitrack production.

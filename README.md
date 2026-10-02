@@ -1,8 +1,22 @@
 # Sonora
 
-A small, native macOS audio editor: drop an audio recording or video, trim its audio, adjust its volume, preview, and export a new audio file. Rust + GPUI, rendered with Metal. A monochrome dot-matrix interface, native macOS file dialogs, audio decoding and playback. No browser, server, account, or network connection at runtime.
+<img src="assets/icon.svg" width="80" alt="Sonora dotted waveform icon">
 
-The complete interface and icon were authored through **Claude Code using `claude-opus-5-5`**, as requested. The independent audio engine uses Apple's AVAudioEngine and AudioToolbox through a small Objective-C bridge. Zeron was a visual and architectural reference; its source is not bundled or copied.
+[Download for macOS](https://github.com/Lxvi101/sonora/releases/latest) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Changelog](CHANGELOG.md)
+
+[![CI](https://github.com/Lxvi101/sonora/actions/workflows/ci.yml/badge.svg)](https://github.com/Lxvi101/sonora/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-white.svg)](LICENSE)
+
+
+A small, native macOS audio editor: drop an audio recording or video, trim its audio, adjust its volume, preview, and export a new audio file. Rust + GPUI, rendered with Metal. A monochrome dot-matrix interface, native macOS file dialogs, audio decoding and playback. No browser runtime, account, or analytics. Editing stays on your Mac; the optional updater checks GitHub for signed releases.
+
+The audio engine uses Apple's AVAudioEngine and AudioToolbox through a small Objective-C bridge. The interface uses GPUI and Metal. [Zeron](https://github.com/zeronsh/zeron) inspired the native approach; its source is not bundled or copied. Sonora was developed with AI assistance, including the Opus-authored interface.
+
+## Install
+
+Download the latest **Apple Silicon** ZIP from [Releases](https://github.com/Lxvi101/sonora/releases/latest), unzip it, and move Sonora to Applications. Official releases are Developer ID signed and notarized. macOS 13 or newer is required; Intel release binaries are not currently provided.
+
+Sonora checks for updates approximately daily and asks before installing. Use **Sonora → Check for Updates…** for a manual check, or turn automatic checks off in the same menu. Updates use [Sparkle](https://sparkle-project.org/) with signed feeds and archives; recordings are never uploaded. Versions before 0.3.0 need this first updater-enabled release installed manually.
 
 ## Run and build
 
@@ -64,7 +78,7 @@ Video import uses AVFoundation. AAC/ALAC soundtracks are copied into a private M
 
 ## Verification
 
-All 36 tests pass, along with formatting and all-target Clippy. The redesigned window's mouse controls, edge resets, gain reset, A/B, loop playback, zoom and native MP3/M4A exports were exercised. Keyboard playback, format selection and Undo were checked, along with cold and warm Launch Services video opening, no-audio errors, and a trimmed/amplified MP3 export from MOV. The installed app's 841-pixel tiled layout was checked with positive gain and the full format/export controls visible. Cross-application dragging could not be completed by the automation tool; the whole-window drop handler is implemented but the physical Finder-to-window gesture remains a manual verification item.
+All 41 tests pass, along with formatting and all-target Clippy. The redesigned window's mouse controls, edge resets, gain reset, A/B, loop playback, zoom and native MP3/M4A exports were exercised. Keyboard playback, format selection and Undo were checked, along with cold and warm Launch Services video opening, no-audio errors, and a trimmed/amplified MP3 export from MOV. The installed app's 841-pixel tiled layout was checked with positive gain and the full format/export controls visible. Cross-application dragging could not be completed by the automation tool; the whole-window drop handler is implemented but the physical Finder-to-window gesture remains a manual verification item.
 
 ```sh
 cargo test --locked --offline
@@ -83,4 +97,8 @@ Export verification: a two-second fixture was independently inspected with ffpro
 
 Video tests cover AAC-in-MP4 and PCM-in-MOV import, trimmed WAV export, source preservation, shared backing-file lifetime, cleanup, cancellation and missing audio. A synthetic three-hour MP4 with a small silent AAC soundtrack imported in **531 ms** in a release engine check; a repeat took **530 ms** with **27 MB** maximum resident size. This measures audio extraction and metadata, not window startup or waveform completion; import time depends on soundtrack size and codecs.
 
-The bundle is locally ad-hoc signed, not Developer ID signed or notarized for public distribution.
+## Open source
+
+Sonora's original code is [MIT licensed](LICENSE). Dependencies retain their own licenses: GPUI is Apache-2.0, Sparkle is MIT with bundled third-party notices, and the dynamically linked LAME encoder is LGPL-2.0-or-later. LAME's corresponding source and rebuild script are included in the repository and app. See [dependency notes](docs/DEPENDENCIES.md).
+
+Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Report reproducible bugs through [Issues](https://github.com/Lxvi101/sonora/issues), and security vulnerabilities through [private reporting](https://github.com/Lxvi101/sonora/security/advisories/new). Maintainer release instructions are in [docs/RELEASING.md](docs/RELEASING.md).

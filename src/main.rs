@@ -8,6 +8,7 @@ use gpui::Application;
 use sonora::audio;
 
 mod ui;
+mod updater;
 
 fn main() {
     // Paths given on the command line (Launch Services' legacy `-psn_` argument

@@ -112,6 +112,14 @@ impl Sonora {
             .on_action(cx.listener(|_, _: &Zoom, window, _| window.zoom_window()))
             .on_action(cx.listener(|this, _: &ToggleHelp, _, cx| this.toggle_help(cx)))
             .on_action(cx.listener(|this, _: &ToggleLoop, _, cx| this.toggle_loop(cx)))
+            .when(self.updates.is_ready(), |root| {
+                root.on_action(
+                    cx.listener(|_, _: &CheckForUpdates, _, _| updater::check_for_updates()),
+                )
+                .on_action(cx.listener(
+                    |this, _: &ToggleAutomaticUpdates, _, cx| this.toggle_automatic_updates(cx),
+                ))
+            })
             .when(wav, |root| {
                 root.on_action(
                     cx.listener(|this, _: &UseWav, _, cx| this.set_format(ExportFormat::Wav, cx)),

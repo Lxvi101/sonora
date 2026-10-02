@@ -1,9 +1,12 @@
 [package]
 name = "sonora"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A small native macOS audio editor"
 license = "MIT"
+repository = "https://github.com/Lxvi101/sonora"
+homepage = "https://github.com/Lxvi101/sonora"
+rust-version = "1.98"
 
 [dependencies]
 gpui = { version = "=0.2.2", default-features = false, features = ["runtime_shaders", "font-kit"] }

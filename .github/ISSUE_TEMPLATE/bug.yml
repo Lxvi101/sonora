@@ -1,0 +1,23 @@
+name: Bug report
+description: Report something that does not work.
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Include what you expected and steps to reproduce. Do not attach private recordings or credentials.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Sonora version and macOS version
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Media details
+      description: Format, duration, channels, sample rate; a synthetic reproducer is ideal.
+  - type: textarea
+    attributes:
+      label: Logs or screenshots
+      description: Remove personal filenames and other private information first.

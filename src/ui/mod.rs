@@ -26,6 +26,7 @@ use gpui::{
 };
 
 use crate::audio::{self, AudioInfo, Edit, ExportFormat, Peak, Player, Waveform};
+use crate::updater;
 use logic::{GAIN_STEP, Handle, View};
 
 actions!(
@@ -72,6 +73,11 @@ actions!(
         ZoomOut,
         ToggleHelp,
         Cancel,
+        About,
+        CheckForUpdates,
+        ToggleAutomaticUpdates,
+        SourceCode,
+        ReportIssue,
     ]
 );
 
@@ -88,6 +94,9 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    cx.on_action(|_: &About, _| updater::show_about());
+    cx.on_action(|_: &SourceCode, cx| cx.open_url(updater::REPOSITORY));
+    cx.on_action(|_: &ReportIssue, cx| cx.open_url(updater::NEW_ISSUE));
 
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
@@ -139,20 +148,58 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("escape", Cancel, None),
     ]);
 
-    cx.set_menus(menus(ExportFormat::Wav));
+    cx.set_menus(menus(MenuState::default()));
 }
 
-/// The menu bar. Rebuilt when the export format changes so the Export item
-/// always names the format it will write.
-fn menus(format: ExportFormat) -> Vec<Menu> {
+/// What the menu bar shows; it is rebuilt whenever this changes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct MenuState {
+    /// The format the Export item names.
+    format: ExportFormat,
+    /// Automatic update checks, when the updater is running.
+    automatic_updates: Option<bool>,
+}
+
+impl Default for MenuState {
+    fn default() -> Self {
+        Self {
+            format: ExportFormat::Wav,
+            automatic_updates: None,
+        }
+    }
+}
+
+/// A checkmark-style menu label (GPUI menus have no native check state).
+fn checked(on: bool, label: &str) -> String {
+    format!("{}{label}", if on { "✓ " } else { "    " })
+}
+
+/// The menu bar. Rebuilt when the export format or the update preference
+/// changes, so labels always say what will happen.
+fn menus(state: MenuState) -> Vec<Menu> {
+    let format = state.format;
     let choice = |f: ExportFormat| {
-        let mark = if f == format { "✓ " } else { "    " };
-        format!("{mark}{} — {}", f.label(), logic::format_detail(f))
+        checked(
+            f == format,
+            &format!("{} — {}", f.label(), logic::format_detail(f)),
+        )
     };
     vec![
         Menu {
             name: "Sonora".into(),
             items: vec![
+                MenuItem::action("About Sonora", About),
+                MenuItem::separator(),
+                // Disabled (no handler registered) unless the updater runs.
+                MenuItem::action("Check for Updates…", CheckForUpdates),
+                MenuItem::action(
+                    checked(
+                        state.automatic_updates == Some(true),
+                        "Automatically Check for Updates",
+                    ),
+                    ToggleAutomaticUpdates,
+                ),
+                MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
                 MenuItem::action("Hide Sonora", Hide),
@@ -235,7 +282,12 @@ fn menus(format: ExportFormat) -> Vec<Menu> {
         },
         Menu {
             name: "Help".into(),
-            items: vec![MenuItem::action("Keyboard & Gestures", ToggleHelp)],
+            items: vec![
+                MenuItem::action("Keyboard & Gestures", ToggleHelp),
+                MenuItem::separator(),
+                MenuItem::action("Sonora Source Code", SourceCode),
+                MenuItem::action("Report an Issue…", ReportIssue),
+            ],
         },
     ]
 }
@@ -270,7 +322,11 @@ pub fn open_main_window(
     // A utility with one window: closing it ends the app.
     cx.on_window_closed(|cx| cx.quit()).detach();
 
+    // Sparkle starts on the main thread once the window exists; it is a
+    // no-op in development runs and unconfigured source builds.
+    let updates = updater::start();
     handle.update(cx, |sonora, window, cx| {
+        sonora.updates = updates;
         window.focus(&sonora.focus);
         if !initial.is_empty() {
             sonora.open_paths(initial, cx);
@@ -337,7 +393,9 @@ pub struct Sonora {
     /// Export format chosen this session; survives opening other files.
     format: ExportFormat,
     /// The format the menu bar currently names.
-    menu_format: ExportFormat,
+    menu_state: MenuState,
+    /// Whether the updater is running (only in configured release bundles).
+    updates: updater::Status,
     /// Loop the selection during preview. A session preference.
     looping: bool,
     help: bool,
@@ -485,7 +543,8 @@ impl Sonora {
             dialog_open: false,
             window_title: String::new(),
             format: ExportFormat::Wav,
-            menu_format: ExportFormat::Wav,
+            menu_state: MenuState::default(),
+            updates: updater::Status::Development,
             looping: false,
             help: false,
             gain_click: None,
@@ -539,10 +598,20 @@ impl Sonora {
 
     /// Keeps the menu bar's Export item naming the real format.
     fn sync_menus(&mut self, cx: &mut Context<Self>) {
-        let format = self.export_format();
-        if format != self.menu_format {
-            self.menu_format = format;
-            cx.set_menus(menus(format));
+        let state = MenuState {
+            format: self.export_format(),
+            automatic_updates: self.updates.is_ready().then(updater::automatic_checks),
+        };
+        if state != self.menu_state {
+            self.menu_state = state;
+            cx.set_menus(menus(state));
+        }
+    }
+
+    fn toggle_automatic_updates(&mut self, cx: &mut Context<Self>) {
+        if self.updates.is_ready() {
+            updater::set_automatic_checks(!updater::automatic_checks());
+            cx.notify();
         }
     }
 

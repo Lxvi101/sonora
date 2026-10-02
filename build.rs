@@ -34,6 +34,7 @@ fn main() {
         .include(lame.join("install/include"))
         .file("native/audio.m")
         .file("native/media.m")
+        .file("native/updater.m")
         .flag("-fobjc-arc")
         .flag("-mmacosx-version-min=13.0")
         .compile("sonora_native");
@@ -48,4 +49,5 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=native/audio.m");
     println!("cargo:rerun-if-changed=native/media.m");
+    println!("cargo:rerun-if-changed=native/updater.m");
 }

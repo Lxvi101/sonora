@@ -1,0 +1,111 @@
+[
+  {
+    "crate": "dtor-0.0.6",
+    "source": "https://raw.githubusercontent.com/mmastrac/rust-ctor/e8c8b4a82de72311a5257db0502ced728081e745/LICENSE-MIT"
+  },
+  {
+    "crate": "dtor-proc-macro-0.0.5",
+    "source": "https://raw.githubusercontent.com/mmastrac/rust-ctor/b05136ac964049a1ee29de763d0b119c42258567/LICENSE-MIT"
+  },
+  {
+    "crate": "lyon-1.0.19",
+    "source": "https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-MIT"
+  },
+  {
+    "crate": "lyon_algorithms-1.0.21",
+    "source": "https://raw.githubusercontent.com/nical/lyon/994526f2766c7e9bc5bb16687232fd7e8999dbdf/LICENSE-MIT"
+  },
+  {
+    "crate": "lyon_geom-1.0.19",
+    "source": "https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-MIT"
+  },
+  {
+    "crate": "lyon_path-1.0.19",
+    "source": "https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-MIT"
+  },
+  {
+    "crate": "lyon_tessellation-1.0.22",
+    "source": "https://raw.githubusercontent.com/nical/lyon/b456b143215a1942a617c4672776b68b9a30feee/LICENSE-MIT"
+  },
+  {
+    "crate": "malloc_buf-0.0.6",
+    "source": "https://raw.githubusercontent.com/SSheldon/malloc_buf/master/LICENSE"
+  },
+  {
+    "crate": "naga-25.0.1",
+    "source": "https://raw.githubusercontent.com/gfx-rs/wgpu/060a779fc5f56560215ea84bda70278cbbd31e72/LICENSE.MIT"
+  },
+  {
+    "crate": "pathfinder_simd-0.5.6",
+    "source": "https://raw.githubusercontent.com/servo/pathfinder/6c3c0466f451c5bd2007087728cd168798cd64e8/LICENSE-MIT"
+  },
+  {
+    "crate": "profiling-1.0.18",
+    "source": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT"
+  },
+  {
+    "crate": "profiling-procmacros-1.0.18",
+    "source": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT"
+  },
+  {
+    "crate": "pulp-wasm-simd-flag-0.1.1",
+    "source": "https://raw.githubusercontent.com/sarah-quinones/pulp/5eb07fd7b68edf0a5e19f71737d315f72a510295/LICENSE"
+  },
+  {
+    "crate": "stacksafe-0.1.4",
+    "source": "https://raw.githubusercontent.com/fast/stacksafe/a5c029b7d3a5fe6771ecd79266b6e21313cfa174/LICENSE"
+  },
+  {
+    "crate": "stacksafe-macro-0.1.4",
+    "source": "https://raw.githubusercontent.com/fast/stacksafe/a5c029b7d3a5fe6771ecd79266b6e21313cfa174/LICENSE"
+  },
+  {
+    "crate": "svg_fmt-0.4.5",
+    "source": "https://raw.githubusercontent.com/nical/rust_debug/93f414cd572b5c2781df93dbdc068ed13443d05a/LICENSE"
+  },
+  {
+    "crate": "taffy-0.9.0",
+    "source": "https://raw.githubusercontent.com/DioxusLabs/taffy/599b1b7d7410d97e13bafc4c01fbe6d7a9cf060a/LICENSE.md"
+  },
+  {
+    "crate": "convert_case-0.4.0",
+    "source": "https://raw.githubusercontent.com/rutrum/convert-case/master/LICENSE",
+    "note": "Supplemental upstream license; the locked crate declares the same license."
+  },
+  {
+    "crate": "hexf-parse-0.2.1",
+    "source": "https://raw.githubusercontent.com/lifthrasiir/hexf/master/LICENSE",
+    "note": "Supplemental upstream license; the locked crate declares the same license."
+  },
+  {
+    "crate": "pathfinder_geometry-0.5.1",
+    "source": "https://raw.githubusercontent.com/servo/pathfinder/main/LICENSE-APACHE",
+    "note": "Supplemental upstream license; the locked crate declares the same license."
+  },
+  {
+    "crate": "simd_helpers-0.1.0",
+    "source": "https://raw.githubusercontent.com/lu-zero/simd_helpers/master/LICENSE",
+    "note": "Supplemental upstream license; the locked crate declares the same license."
+  },
+  {
+    "crate": "zune-inflate-0.2.54",
+    "source": "https://raw.githubusercontent.com/etemesi254/zune-image/dev/LICENSE-APACHE",
+    "note": "Supplemental upstream license; the locked crate declares the same license."
+  },
+  {
+    "crate": "leak-0.1.2",
+    "source": "Apache-2.0 standard license text; elected from the locked crate MIT OR Apache-2.0 declaration."
+  },
+  {
+    "crate": "leaky-cow-0.1.1",
+    "source": "Apache-2.0 standard license text; elected from the locked crate MIT OR Apache-2.0 declaration."
+  },
+  {
+    "crate": "block-0.1.6",
+    "source": "Locked crates.io Cargo.toml declares MIT and names these authors; upstream crate omits a license file. Standard MIT text reproduced with author attribution."
+  },
+  {
+    "crate": "seahash-4.1.0",
+    "source": "Locked crates.io Cargo.toml declares MIT and names these authors; upstream crate omits a license file. Standard MIT text reproduced with author attribution."
+  }
+]
