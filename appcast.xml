@@ -1,8 +1,20 @@
-<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+<?xml version="1.0" standalone="yes"?>
+<!-- sparkle-sign-warning:
 IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
---><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+-->
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
     <channel>
         <title>Sonora</title>
+        <item>
+            <title>0.4.0</title>
+            <pubDate>Fri, 02 Oct 2026 17:27:37 +0200</pubDate>
+            <link>https://github.com/Lxvi101/sonora</link>
+            <sparkle:version>4</sparkle:version>
+            <sparkle:shortVersionString>0.4.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/Lxvi101/sonora/releases/download/v0.4.0/Sonora-0.4.0-arm64.zip" length="5466482" type="application/octet-stream" sparkle:edSignature="YvWBfVtJ1DLxVNeY2H/F61ygiNzL9RjV2BNF8U8WaN2Dq9O3qWgMw/fK/Z1EPmGYDwEkyeEXenzVp54pokHIAQ=="/>
+        </item>
         <item>
             <title>0.3.0</title>
             <pubDate>Fri, 02 Oct 2026 13:19:29 +0200</pubDate>
@@ -11,10 +23,11 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
             <sparkle:shortVersionString>0.3.0</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/Lxvi101/sonora/releases/download/v0.3.0/Sonora-0.3.0-arm64.zip" length="5429455" type="application/octet-stream" sparkle:edSignature="dSeV3uwq/GbcaAWKuioKihJzKTANIDz9gejQzzX97Xx6rOEPxFdMAvray59IpTeKwiuPScxH+Y7qV6B3DsBYCw=="></enclosure>
+            <enclosure url="https://github.com/Lxvi101/sonora/releases/download/v0.3.0/Sonora-0.3.0-arm64.zip" length="5429455" type="application/octet-stream" sparkle:edSignature="dSeV3uwq/GbcaAWKuioKihJzKTANIDz9gejQzzX97Xx6rOEPxFdMAvray59IpTeKwiuPScxH+Y7qV6B3DsBYCw=="/>
         </item>
     </channel>
-</rss><!-- sparkle-signatures:
-edSignature: 3X2kyftimulB5318eJX13MVFfT/Hh+91wiECXhAkRpFSllPoovLUph/BrLxaNQTVfyLMR4a68uAmVvEoAxykDg==
-length: 1178
+</rss>
+<!-- sparkle-signatures:
+edSignature: iHdwtE4crNZR84QZGOvJtYSpShEmGequRblJEp2kB0r1R7+EJZ3RmW4nqu3JC/JZ9JfFhGRAfNRiEQ3+3mXICA==
+length: 1910
 -->
