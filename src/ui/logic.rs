@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::audio::{Edit, ExportFormat};
+use crate::timeline::Timeline;
 
 pub const GAIN_MIN: f32 = -24.0;
 pub const GAIN_MAX: f32 = 24.0;
@@ -20,6 +21,105 @@ pub const FORMATS: [ExportFormat; 3] = [ExportFormat::Wav, ExportFormat::Mp3, Ex
 pub enum Handle {
     Start,
     End,
+}
+
+/// The two pointer tools. Select (V) picks and reorders clips and keeps the
+/// trim gestures; Razor (C) cuts the clip under the pointer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Tool {
+    #[default]
+    Select,
+    Razor,
+}
+
+// ---- Clip selection ------------------------------------------------------------
+
+/// How a click changes the clip selection: plain picks one clip, ⌘ toggles
+/// it, ⇧ extends from the anchor. Returns the new selection and anchor.
+pub fn click_selection(
+    selected: &[usize],
+    anchor: Option<usize>,
+    index: usize,
+    toggle: bool,
+    extend: bool,
+) -> (Vec<usize>, Option<usize>) {
+    if extend {
+        let from = anchor.unwrap_or(index);
+        let mut out: Vec<usize> = selected.to_vec();
+        out.extend(from.min(index)..=from.max(index));
+        out.sort_unstable();
+        out.dedup();
+        (out, Some(from))
+    } else if toggle {
+        let mut out: Vec<usize> = selected.iter().copied().filter(|&i| i != index).collect();
+        if out.len() == selected.len() {
+            out.push(index);
+            out.sort_unstable();
+        }
+        (out, Some(index))
+    } else {
+        (vec![index], Some(index))
+    }
+}
+
+/// A timeline time after ripple-deleting `deleted` from `before`: the same
+/// audio's new time, or the join that replaced it.
+pub fn ripple_time(before: &Timeline, deleted: &[usize], time: f64, sample_rate: f64) -> f64 {
+    let frame = (time.max(0.0) * sample_rate).round() as u64;
+    before.ripple(deleted, frame) as f64 / sample_rate
+}
+
+/// The trim after a ripple delete. Its edges follow their audio; if the
+/// trimmed audio itself is gone, everything left is kept; if nothing is
+/// left, an empty edit (no playback, no export) until undo or reset.
+pub fn edit_after_delete(
+    edit: Edit,
+    before: &Timeline,
+    deleted: &[usize],
+    sample_rate: f64,
+) -> Edit {
+    let remaining = before.ripple(deleted, before.frames());
+    let whole = remaining as f64 / sample_rate;
+    let kept = Edit {
+        start: ripple_time(before, deleted, edit.start, sample_rate),
+        end: ripple_time(before, deleted, edit.end, sample_rate),
+        ..edit
+    };
+    if remaining == 0 {
+        Edit {
+            start: 0.0,
+            end: 0.0,
+            ..edit
+        }
+    } else if kept.end - kept.start >= MIN_SELECTION
+        && kept.validate_frames(remaining, sample_rate).is_ok()
+    {
+        kept
+    } else {
+        Edit {
+            start: 0.0,
+            end: whole,
+            ..edit
+        }
+    }
+}
+
+/// Selection indices after a cut whose right-hand piece landed at `right`:
+/// later clips shift by one, and a selected clip stays selected as two halves.
+pub fn selection_after_split(selected: &[usize], right: usize) -> Vec<usize> {
+    let mut out = Vec::with_capacity(selected.len() + 1);
+    for &i in selected {
+        if i >= right {
+            out.push(i + 1);
+        } else {
+            out.push(i);
+            if i + 1 == right {
+                out.push(right);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
 }
 
 // ---- Edits -----------------------------------------------------------------
@@ -372,6 +472,85 @@ mod tests {
         assert_eq!(set_in(e, 30.0, D), edit(30.0, D, 1.0));
         assert_eq!(set_out(e, 15.0, D), edit(10.0, 15.0, 1.0));
         assert_eq!(set_out(e, 5.0, D), edit(0.0, 5.0, 1.0));
+    }
+
+    #[test]
+    fn clicks_pick_toggle_and_extend_clips() {
+        assert_eq!(
+            click_selection(&[0, 2], Some(0), 3, false, false),
+            (vec![3], Some(3))
+        );
+        assert_eq!(
+            click_selection(&[0, 2], Some(0), 3, true, false),
+            (vec![0, 2, 3], Some(3))
+        );
+        assert_eq!(
+            click_selection(&[0, 2], Some(0), 2, true, false),
+            (vec![0], Some(2))
+        );
+        assert_eq!(
+            click_selection(&[1], Some(1), 4, false, true),
+            (vec![1, 2, 3, 4], Some(1))
+        );
+        assert_eq!(
+            click_selection(&[5], Some(5), 3, false, true),
+            (vec![3, 4, 5], Some(5))
+        );
+        assert_eq!(
+            click_selection(&[], None, 2, false, true),
+            (vec![2], Some(2))
+        );
+    }
+
+    #[test]
+    fn cuts_keep_the_selection_on_the_same_audio() {
+        // Clips 0..4, cutting clip 1 (its right half becomes clip 2).
+        assert_eq!(selection_after_split(&[1], 2), vec![1, 2]);
+        assert_eq!(selection_after_split(&[0, 3], 2), vec![0, 4]);
+        assert_eq!(selection_after_split(&[2], 2), vec![3]);
+        assert!(selection_after_split(&[], 1).is_empty());
+    }
+
+    #[test]
+    fn ripple_delete_keeps_the_trim_on_its_audio() {
+        // 100 frames at 10 Hz: clips 0–3 s, 3–7 s, 7–10 s.
+        let mut t = Timeline::new(100);
+        t.split(30);
+        t.split(70);
+        // Trim 2–8 s; deleting the middle clip leaves 2–4 s of what remains.
+        let e = edit(2.0, 8.0, 3.0);
+        assert_eq!(edit_after_delete(e, &t, &[1], 10.0), edit(2.0, 4.0, 3.0));
+        // A whole-timeline trim stays whole.
+        let full = edit(0.0, 10.0, 0.0);
+        assert_eq!(edit_after_delete(full, &t, &[0], 10.0), edit(0.0, 7.0, 0.0));
+        // Deleting exactly the trimmed audio keeps everything left.
+        assert_eq!(
+            edit_after_delete(edit(3.0, 7.0, 1.0), &t, &[1], 10.0),
+            edit(0.0, 6.0, 1.0)
+        );
+        // Nothing left: an empty edit that keeps the gain.
+        let empty = edit_after_delete(e, &t, &[0, 1, 2], 10.0);
+        assert_eq!(empty, edit(0.0, 0.0, 3.0));
+        assert!(empty.validate_frames(0, 10.0).is_err());
+        assert_eq!(ripple_time(&t, &[1], 5.0, 10.0), 3.0);
+        assert_eq!(ripple_time(&t, &[1], 9.0, 10.0), 5.0);
+    }
+
+    #[test]
+    fn undo_snapshots_restore_arrangement_and_trim_together() {
+        // The document's history stores (edit, timeline) pairs; restoring one
+        // must give back a consistent, exportable state, even from empty.
+        let mut t = Timeline::new(100);
+        t.split(40);
+        let e = edit(1.0, 9.0, 2.0);
+        let snapshot = (e, t.clone());
+        let after = edit_after_delete(e, &t, &[0, 1], 10.0);
+        assert!(t.delete(&[0, 1]));
+        assert!(after.validate_frames(t.frames(), 10.0).is_err());
+        let (e, t) = snapshot;
+        assert_eq!(t.frames(), 100);
+        assert!(e.validate_frames(t.frames(), 10.0).is_ok());
+        assert_eq!(t.clips().len(), 2);
     }
 
     #[test]

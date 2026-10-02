@@ -93,14 +93,23 @@ impl Sonora {
     fn register_actions(&self, root: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
         let doc = self.doc();
         let ready = doc.is_some();
-        let playable = doc.is_some_and(|d| d.playable);
+        // A document whose clips were all deleted keeps only history,
+        // reset and the tools; nothing plays, trims or exports.
+        let audible = doc.is_some_and(Document::has_audio);
+        let playable = audible && doc.is_some_and(|d| d.playable);
         let exporting = doc.is_some_and(|d| d.export.is_some());
+        let clips_selected = doc.is_some_and(|d| !d.selected.is_empty());
         let can_undo = doc.is_some_and(|d| !d.undo.is_empty());
         let can_redo = doc.is_some_and(|d| !d.redo.is_empty());
         let edited = doc.is_some_and(Document::is_edited);
         let zoomed = doc.is_some_and(|d| !d.view.is_full(d.duration()));
         let opening = matches!(self.phase, Phase::Opening(_));
-        let cancellable = self.help || opening || exporting || self.notice.is_some();
+        let cancellable = self.help
+            || opening
+            || exporting
+            || self.notice.is_some()
+            || self.tool == Tool::Razor
+            || clips_selected;
         let (wav, mp3, m4a) = (
             self.can_use(ExportFormat::Wav),
             self.can_use(ExportFormat::Mp3),
@@ -140,7 +149,24 @@ impl Sonora {
             })
             .when(ready, |root| {
                 root.on_action(cx.listener(|this, _: &RevealSource, _, cx| this.reveal_source(cx)))
-                    .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
+                    .on_action(
+                        cx.listener(|this, _: &SelectTool, _, cx| this.set_tool(Tool::Select, cx)),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &RazorTool, _, cx| this.set_tool(Tool::Razor, cx)),
+                    )
+            })
+            .when(clips_selected, |root| {
+                root.on_action(cx.listener(|this, _: &DeleteClips, _, cx| this.delete_selected(cx)))
+                    .on_action(
+                        cx.listener(|this, _: &DeselectClips, _, cx| this.deselect_clips(cx)),
+                    )
+            })
+            .when(audible, |root| {
+                root.on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all_clips(cx)))
+                    .on_action(
+                        cx.listener(|this, _: &SplitAtPlayhead, _, cx| this.split_at_playhead(cx)),
+                    )
                     .on_action(cx.listener(|this, _: &SetIn, _, cx| this.set_in(cx)))
                     .on_action(cx.listener(|this, _: &SetOut, _, cx| this.set_out(cx)))
                     .on_action(
@@ -189,7 +215,7 @@ impl Sonora {
             .when(playable, |root| {
                 root.on_action(cx.listener(|this, _: &PlayPause, _, cx| this.toggle_playback(cx)))
             })
-            .when(ready && !exporting, |root| {
+            .when(audible && !exporting, |root| {
                 root.on_action(
                     cx.listener(|this, _: &Export, window, cx| this.prompt_export(window, cx)),
                 )
@@ -289,6 +315,7 @@ impl Sonora {
         };
 
         let facts = self.doc().filter(|_| width >= 700.0).map(|doc| {
+            let clips = doc.timeline.clips().len();
             div()
                 .flex()
                 .flex_none()
@@ -297,6 +324,14 @@ impl Sonora {
                 .font(theme::numeric(FontWeight::MEDIUM))
                 .text_size(px(11.))
                 .text_color(theme::text_faint())
+                .when(clips != 1, |row| {
+                    row.child(if clips == 0 {
+                        "No clips".to_string()
+                    } else {
+                        format!("{clips} clips")
+                    })
+                    .child(separator_dot())
+                })
                 .child(theme::sample_rate(doc.info.sample_rate))
                 .child(separator_dot())
                 .child(theme::channels(doc.info.channels))
@@ -343,11 +378,38 @@ impl Sonora {
         match &self.phase {
             Phase::Empty => stage.child(self.render_empty(cx)),
             Phase::Opening(import) => stage.child(render_opening(import, cx)),
+            Phase::Ready(doc) if !doc.has_audio() => stage
+                .child(self.render_edit_bar(doc, width, cx))
+                .child(render_empty_timeline(cx)),
             Phase::Ready(doc) => {
                 let dragging = match self.drag {
                     Some(Drag::Handle { handle, .. }) => Some(handle),
                     _ => None,
                 };
+                // A reorder drag that has moved: the block follows the
+                // pointer and the clips it lifted stay as outlines.
+                let reorder = match self.drag {
+                    Some(Drag::Clips {
+                        moved: true,
+                        grab,
+                        pointer,
+                        target,
+                        ..
+                    }) => Some((pointer - grab, target)),
+                    _ => None,
+                };
+                let ghost = reorder.map(|(start, _)| {
+                    let clips = doc.timeline.clips();
+                    let frames: u64 = doc.selected.iter().map(|&i| clips[i].frames()).sum();
+                    wave::Ghost {
+                        start,
+                        end: start + doc.seconds(frames),
+                        count: doc.selected.len(),
+                    }
+                });
+                let insertion = reorder
+                    .and_then(|(_, target)| target)
+                    .map(|b| doc.seconds(doc.timeline.boundary_frame(b)));
                 let message: Option<SharedString> = if let Some(err) = &doc.wave_error {
                     Some(
                         format!("Waveform unavailable — {err} Preview and export still work.")
@@ -362,6 +424,7 @@ impl Sonora {
                     peaks: doc.peaks.clone(),
                     exact: doc.peaks_exact,
                     duration: doc.duration(),
+                    source_duration: doc.info.duration(),
                     view: doc.view,
                     start: doc.edit.start,
                     end: doc.edit.end,
@@ -370,6 +433,13 @@ impl Sonora {
                     hover: self.hover,
                     dragging,
                     message,
+                    tool: self.tool,
+                    clips: scene_clips(doc, reorder.is_some()),
+                    razor: self.razor_at.filter(|_| self.drag.is_none()),
+                    insertion,
+                    ghost,
+                    lane_hover: self.lane_hover,
+                    holding_clips: matches!(self.drag, Some(Drag::Clips { .. })),
                 };
                 stage.child(self.render_edit_bar(doc, width, cx)).child(
                     div()
@@ -399,6 +469,47 @@ impl Sonora {
         let can_undo = !doc.undo.is_empty();
         let can_redo = !doc.redo.is_empty();
         let edited = doc.is_edited();
+        let audible = doc.has_audio();
+
+        // The two tools, as one compact segmented control.
+        let tool = self.tool;
+        let tools = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(28.))
+            .p(px(2.))
+            .gap(px(2.))
+            .rounded(px(8.))
+            .bg(theme::white(0.04))
+            .border_1()
+            .border_color(theme::white(0.12))
+            .child(
+                tool_button("tool-select", tool == Tool::Select)
+                    .tooltip(tooltip(
+                        "Select — click a clip to select it, drag its bar to reorder",
+                        Some("V"),
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Select, cx)))
+                    .child(icon(
+                        "icons/select.svg",
+                        14.,
+                        icon_ink(true, tool == Tool::Select),
+                    )),
+            )
+            .child(
+                tool_button("tool-razor", tool == Tool::Razor)
+                    .tooltip(tooltip(
+                        "Razor — click a clip to cut it there · ⌘B cuts at the playhead",
+                        Some("C"),
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Razor, cx)))
+                    .child(icon(
+                        "icons/razor.svg",
+                        14.,
+                        icon_ink(true, tool == Tool::Razor),
+                    )),
+            );
 
         let trim = div()
             .flex()
@@ -446,7 +557,7 @@ impl Sonora {
             )
             .child(
                 icon_button("reset", edited, false)
-                    .tooltip(tooltip("Reset trim and gain", Some("⌘⌫")))
+                    .tooltip(tooltip("Reset cuts, clip order, trim and gain", Some("⌘⌫")))
                     .when(edited, |b| {
                         b.on_click(cx.listener(|this, _, _, cx| this.reset_edits(cx)))
                     })
@@ -459,7 +570,8 @@ impl Sonora {
         let bins = doc.peaks.as_ref().map_or(0, |p| p.len());
         // Roughly one dot column per 5 px of the well.
         let columns = ((width - 24.0 - 32.0) / 5.0).max(1.0) as f64;
-        let magnified = bins > 0 && logic::visible_bins(bins, view, duration) < columns;
+        // The overview's bins span the source, whatever the arrangement.
+        let magnified = bins > 0 && logic::visible_bins(bins, view, doc.info.duration()) < columns;
 
         let readout = div()
             .flex()
@@ -575,14 +687,17 @@ impl Sonora {
             .flex()
             .items_center()
             .gap(px(10.))
-            .child(trim)
-            .when(width >= 700.0, |bar| {
-                bar.child(vertical_rule()).child(history)
+            .child(tools)
+            .child(vertical_rule())
+            .when(audible, |bar| bar.child(trim))
+            .when(width >= 700.0 || !audible, |bar| {
+                bar.when(audible, |bar| bar.child(vertical_rule()))
+                    .child(history)
             })
             .child(div().flex_1())
-            .children(original)
-            .child(readout)
-            .child(zoom)
+            .when(audible, |bar| {
+                bar.children(original).child(readout).child(zoom)
+            })
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -659,25 +774,30 @@ impl Sonora {
             return div().into_any_element();
         };
         let playing = doc.playing;
-        let playable = doc.playable;
+        let audible = doc.has_audio();
+        let playable = doc.playable && audible;
         let exporting = doc.export.is_some();
         let edit = doc.edit;
         let clip = clip_state(doc);
         let format = self.export_format();
         let fold = TransportFold::for_width(width);
 
-        let to_start = icon_button("to-start", true, false)
+        let to_start = icon_button("to-start", audible, false)
             .tooltip(tooltip("Go to selection start", Some("↑")))
-            .on_click(cx.listener(|this, _, _, cx| {
-                let start = this.doc().map_or(0.0, |d| d.edit.start);
-                this.seek_to(start, cx);
-            }))
-            .child(icon("icons/to-start.svg", 14., icon_ink(true, false)));
+            .when(audible, |b| {
+                b.on_click(cx.listener(|this, _, _, cx| {
+                    let start = this.doc().map_or(0.0, |d| d.edit.start);
+                    this.seek_to(start, cx);
+                }))
+            })
+            .child(icon("icons/to-start.svg", 14., icon_ink(audible, false)));
 
         // A distinct id per state, so hover and tooltip state never carry a
         // stale "Play" across into playback (or back).
         let play = play_button(if playing { "pause" } else { "play" }, playable)
-            .tooltip(if !playable {
+            .tooltip(if !audible {
+                tooltip("Nothing to play — every clip was deleted", None)
+            } else if !playable {
                 tooltip("Preview unavailable for this file", None)
             } else if playing {
                 tooltip("Pause", Some("Space"))
@@ -897,10 +1017,18 @@ impl Sonora {
                     })
                     .into_any_element()
             }
+            None if !audible => primary_button("export", false)
+                .tooltip(tooltip(
+                    "Nothing to export — undo or reset to bring clips back",
+                    None,
+                ))
+                .child(icon("icons/export.svg", 13., theme::text_faint()))
+                .child(format!("Export {}", format.label()))
+                .into_any_element(),
             None => primary_button("export", true)
                 .tooltip(tooltip(
                     format!(
-                        "Export the selection as {} ({})",
+                        "Export the trimmed timeline as {} ({})",
                         format.label(),
                         logic::format_detail(format)
                     ),
@@ -1089,6 +1217,10 @@ impl Sonora {
             };
         }
 
+        if let Some(hint) = doc.and_then(|doc| self.clip_hint(doc)) {
+            return hint;
+        }
+
         if let Some(doc) = doc
             && doc.wave_error.is_none()
             && !doc.peaks_exact
@@ -1122,7 +1254,81 @@ impl Sonora {
                 .child(keycap("⌘O"))
                 .into_any_element();
         }
+        // An untouched file: say how cutting starts.
+        if let Some(doc) = doc
+            && doc.timeline.clips().len() == 1
+        {
+            return status_row()
+                .text_color(theme::text_ghost())
+                .child(div().min_w_0().truncate().child("Cut with the razor"))
+                .child(keycap("C"))
+                .child(div().flex_none().child("or at the playhead"))
+                .child(keycap("⌘B"))
+                .into_any_element();
+        }
         div().into_any_element()
+    }
+
+    /// What the clip tools are doing, and the keys that go with it.
+    fn clip_hint(&self, doc: &Document) -> Option<AnyElement> {
+        let count = doc.selected.len();
+        let clips = |n: usize| {
+            if n == 1 {
+                "1 clip".to_string()
+            } else {
+                format!("{n} clips")
+            }
+        };
+        let text = |t: String| div().min_w_0().truncate().child(t);
+        if let Some(Drag::Clips {
+            moved: true,
+            target,
+            ..
+        }) = self.drag
+        {
+            return Some(
+                status_row()
+                    .text_color(theme::text())
+                    .child(text(if target.is_some() {
+                        format!("Release to move {} to the marked join", clips(count))
+                    } else {
+                        "Move over another join to reorder".into()
+                    }))
+                    .child(keycap("Esc"))
+                    .into_any_element(),
+            );
+        }
+        if self.tool == Tool::Razor {
+            return Some(
+                status_row()
+                    .text_color(theme::text_muted())
+                    .child(text("Razor — click a clip to cut it at the pointer".into()))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme::text_faint())
+                            .child("Select"),
+                    )
+                    .child(keycap("V"))
+                    .into_any_element(),
+            );
+        }
+        (count > 0 && doc.has_audio()).then(|| {
+            status_row()
+                .text_color(theme::text_muted())
+                .child(text(format!(
+                    "{} selected · drag the clip bar to reorder",
+                    clips(count)
+                )))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(theme::text_faint())
+                        .child("Ripple delete"),
+                )
+                .child(keycap("⌫"))
+                .into_any_element()
+        })
     }
 }
 
@@ -1445,6 +1651,19 @@ fn help_sheet(cx: &mut Context<Sonora>) -> impl IntoElement {
         ("⌘Z  ⇧⌘Z", "Undo / redo"),
         ("⇧⌘S", "Export"),
     ];
+    const CLIPS: &[(&str, &str)] = &[
+        ("V", "Select tool"),
+        ("C", "Razor tool"),
+        ("Razor click", "Cut at the pointer"),
+        ("⌘B", "Cut at the playhead"),
+        ("Click clip", "Select it"),
+        ("⌘ / ⇧ click", "Add · extend"),
+        ("⌘A", "Select all clips"),
+        ("Drag clip bar", "Reorder, snaps to joins"),
+        ("⌫", "Delete, closing the gap"),
+        ("Esc", "Deselect · Select tool"),
+        ("⌘Z  ⌘⌫", "Undo · reset all"),
+    ];
     const GESTURES: &[(&str, &str)] = &[
         ("Click", "Move the playhead"),
         ("Drag", "Select a range"),
@@ -1461,9 +1680,15 @@ fn help_sheet(cx: &mut Context<Sonora>) -> impl IntoElement {
             .flex()
             .items_center()
             .justify_between()
-            .gap(px(12.))
+            .gap(px(10.))
             .h(px(22.))
-            .child(div().text_color(theme::text_muted()).child(label))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme::text_muted())
+                    .child(label),
+            )
             .child(keycap(keys))
     };
     let column = |title: &'static str, rows: &'static [(&'static str, &'static str)]| {
@@ -1496,8 +1721,10 @@ fn help_sheet(cx: &mut Context<Sonora>) -> impl IntoElement {
         .child(
             div()
                 .id("help-panel")
-                .w(px(560.))
+                .w(px(780.))
                 .max_w_full()
+                .max_h_full()
+                .overflow_y_scroll()
                 .mx(px(20.))
                 .p(px(22.))
                 .rounded(px(14.))
@@ -1519,7 +1746,7 @@ fn help_sheet(cx: &mut Context<Sonora>) -> impl IntoElement {
                             theme::white(0.95),
                             theme::white(0.12),
                         ))
-                        .child(caps("Keyboard & gestures", 10., theme::text()))
+                        .child(caps("Editing, keyboard & gestures", 10., theme::text()))
                         .child(div().flex_1())
                         .child(
                             link_button("close-help", theme::text_muted())
@@ -1531,29 +1758,141 @@ fn help_sheet(cx: &mut Context<Sonora>) -> impl IntoElement {
                 .child(
                     div()
                         .flex()
-                        .gap(px(28.))
+                        .gap(px(24.))
                         .child(column("Keys", KEYS))
+                        .child(column("Clips", CLIPS))
                         .child(column("Pointer", GESTURES)),
                 ),
         )
 }
 
-/// Loudest absolute sample inside the selection, per the current overview.
+/// Loudest absolute sample inside the trimmed arrangement, per the current
+/// overview. Remembered until the trim, the clips or the overview change,
+/// so the per-frame redraw during playback never rescans it.
 fn selection_peak(doc: &Document) -> Option<f32> {
-    let peaks = doc.peaks.as_deref().filter(|p| !p.is_empty())?;
-    let duration = doc.duration().max(1e-9);
+    let peaks = doc.peaks.as_ref().filter(|p| !p.is_empty())?;
+    let key = (
+        doc.edit.start.to_bits(),
+        doc.edit.end.to_bits(),
+        doc.revision,
+        Arc::as_ptr(peaks) as usize,
+    );
+    if let Some((cached, peak)) = doc.peak_memo.get()
+        && cached == key
+    {
+        return peak;
+    }
+    let rate = doc.info.sample_rate;
+    let frames = doc.edit.frame_range(rate, doc.timeline.frames());
     let n = peaks.len();
-    let b0 = ((doc.edit.start / duration) * n as f64)
-        .floor()
-        .clamp(0.0, (n - 1) as f64) as usize;
-    let b1 = ((doc.edit.end / duration) * n as f64)
-        .ceil()
-        .clamp((b0 + 1) as f64, n as f64) as usize;
-    Some(
-        peaks[b0..b1]
+    let scale = n as f64 / doc.info.frames.max(1) as f64;
+    let mut found = None;
+    for range in doc.timeline.ranges(frames) {
+        let b0 = ((range.start as f64 * scale).floor() as usize).min(n - 1);
+        let b1 = ((range.end as f64 * scale).ceil() as usize).clamp(b0 + 1, n);
+        let peak = peaks[b0..b1]
             .iter()
-            .fold(0f32, |acc, p| acc.max(p.min.abs()).max(p.max.abs())),
-    )
+            .fold(0f32, |acc, p| acc.max(p.min.abs()).max(p.max.abs()));
+        found = Some(found.map_or(peak, |f: f32| f.max(peak)));
+    }
+    doc.peak_memo.set(Some((key, found)));
+    found
+}
+
+/// The clips overlapping the view, for the stage. `lifting`: a reorder drag
+/// is under way, so the selected clips draw as lifted outlines.
+fn scene_clips(doc: &Document, lifting: bool) -> Vec<wave::SceneClip> {
+    let view = doc.view;
+    let mut out = Vec::new();
+    for (index, (offset, clip)) in doc.timeline.spans().enumerate() {
+        let start = doc.seconds(offset);
+        let end = doc.seconds(offset + clip.frames());
+        if end < view.start {
+            continue;
+        }
+        if start > view.end {
+            break;
+        }
+        let selected = doc.selected.binary_search(&index).is_ok();
+        out.push(wave::SceneClip {
+            number: index + 1,
+            start,
+            end,
+            source: doc.seconds(clip.start),
+            selected,
+            lifted: selected && lifting,
+        });
+    }
+    out
+}
+
+/// One segment of the tool picker.
+fn tool_button(id: &'static str, on: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .cursor_pointer()
+        .map(|el| {
+            if on {
+                el.bg(theme::white(0.94))
+            } else {
+                el.hover(|s| s.bg(theme::white(0.08)))
+                    .active(|s| s.bg(theme::white(0.13)))
+            }
+        })
+}
+
+/// The stage once every clip is gone: nothing to draw, two ways back.
+fn render_empty_timeline(cx: &mut Context<Sonora>) -> impl IntoElement {
+    field_zone()
+        .child(dot_glyph(
+            &[1, 1, 1, 1, 1, 1, 1, 1, 1],
+            6.,
+            4.,
+            theme::white(0.3),
+            theme::white(0.06),
+        ))
+        .child(
+            div()
+                .mt(px(22.))
+                .text_size(px(16.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Every clip was deleted."),
+        )
+        .child(
+            div()
+                .mt(px(8.))
+                .max_w(px(400.))
+                .text_center()
+                .text_color(theme::text_muted())
+                .child("The original file is untouched. Undo brings back the last clips; reset restores the whole recording."),
+        )
+        .child(
+            div()
+                .mt(px(20.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(
+                    primary_button("empty-undo", true)
+                        .tooltip(tooltip("Undo the delete", Some("⌘Z")))
+                        .on_click(cx.listener(|this, _, _, cx| this.undo(cx)))
+                        .child(icon("icons/undo.svg", 14., theme::black(0.9)))
+                        .child("Undo"),
+                )
+                .child(
+                    link_button("empty-reset", theme::text_muted())
+                        .tooltip(tooltip("Back to the untouched recording", Some("⌘⌫")))
+                        .on_click(cx.listener(|this, _, _, cx| this.reset_edits(cx)))
+                        .child("Reset all edits")
+                        .child(keycap("⌘⌫")),
+                ),
+        )
 }
 
 fn clip_state(doc: &Document) -> Clip {

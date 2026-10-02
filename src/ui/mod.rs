@@ -1,5 +1,10 @@
-//! Sonora's single-document window: open one audio file, trim it, raise or
-//! lower its gain, preview, and export a new WAV, MP3 or M4A.
+//! Sonora's single-document window: open one audio file, cut it into clips,
+//! drop or reorder them on one gapless track, trim, raise or lower its gain,
+//! preview, and export a new WAV, MP3 or M4A.
+//!
+//! Clips are non-destructive source ranges (`Timeline`); positions, trim,
+//! the view and the playhead are all arranged-timeline seconds. One undo
+//! history covers cuts, deletes, moves, trim and gain.
 //!
 //! All decoding work (probe, waveform, export) runs off the main thread. Each
 //! opened file gets a fresh `generation`; results carrying an older generation
@@ -14,6 +19,7 @@ mod view;
 mod wave;
 mod widgets;
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -26,8 +32,9 @@ use gpui::{
 };
 
 use crate::audio::{self, AudioInfo, Edit, ExportFormat, Peak, Player, Waveform};
+use crate::timeline::Timeline;
 use crate::updater;
-use logic::{GAIN_STEP, Handle, View};
+use logic::{GAIN_STEP, Handle, Tool, View};
 
 actions!(
     sonora,
@@ -48,6 +55,11 @@ actions!(
         Undo,
         Redo,
         SelectAll,
+        DeselectClips,
+        SelectTool,
+        RazorTool,
+        SplitAtPlayhead,
+        DeleteClips,
         ResetEdits,
         ResetStart,
         ResetEnd,
@@ -87,6 +99,8 @@ const UNDO_LIMIT: usize = 200;
 const HANDLE_SLOP: f32 = 2.5;
 /// Gain-slider travel (dB) before a grab becomes a drag.
 const GAIN_SLOP: f32 = 0.8;
+/// Pointer travel before a press on the clip bar becomes a reorder drag.
+const CLIP_SLOP: f32 = 3.0;
 
 /// Registers key bindings, menus and app-wide actions.
 pub fn init(cx: &mut App) {
@@ -113,6 +127,12 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-z", Undo, None),
         KeyBinding::new("cmd-shift-z", Redo, None),
         KeyBinding::new("cmd-a", SelectAll, None),
+        KeyBinding::new("cmd-shift-a", DeselectClips, None),
+        KeyBinding::new("v", SelectTool, None),
+        KeyBinding::new("c", RazorTool, None),
+        KeyBinding::new("cmd-b", SplitAtPlayhead, None),
+        KeyBinding::new("backspace", DeleteClips, None),
+        KeyBinding::new("delete", DeleteClips, None),
         KeyBinding::new("cmd-backspace", ResetEdits, None),
         KeyBinding::new("i", SetIn, None),
         KeyBinding::new("o", SetOut, None),
@@ -158,6 +178,8 @@ struct MenuState {
     format: ExportFormat,
     /// Automatic update checks, when the updater is running.
     automatic_updates: Option<bool>,
+    /// The pointer tool the Clip menu checks.
+    tool: Tool,
 }
 
 impl Default for MenuState {
@@ -165,6 +187,7 @@ impl Default for MenuState {
         Self {
             format: ExportFormat::Wav,
             automatic_updates: None,
+            tool: Tool::Select,
         }
     }
 }
@@ -234,17 +257,40 @@ fn menus(state: MenuState) -> Vec<Menu> {
                 MenuItem::os_action("Undo", Undo, OsAction::Undo),
                 MenuItem::os_action("Redo", Redo, OsAction::Redo),
                 MenuItem::separator(),
-                MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+                MenuItem::os_action("Select All Clips", SelectAll, OsAction::SelectAll),
+                MenuItem::action("Deselect All Clips", DeselectClips),
+                MenuItem::separator(),
                 MenuItem::action("Set Start at Playhead", SetIn),
                 MenuItem::action("Set End at Playhead", SetOut),
                 MenuItem::action("Reset Start to Beginning", ResetStart),
-                MenuItem::action("Reset End to File End", ResetEnd),
+                MenuItem::action("Reset End to Timeline End", ResetEnd),
                 MenuItem::separator(),
                 MenuItem::action("Louder", GainUp),
                 MenuItem::action("Quieter", GainDown),
                 MenuItem::action("Reset Gain to 0 dB", ResetGain),
                 MenuItem::separator(),
-                MenuItem::action("Reset Trim and Gain", ResetEdits),
+                MenuItem::action("Reset All Edits", ResetEdits),
+            ],
+        },
+        // The editing workflow in one place: pick a tool, cut, remove.
+        // Reordering is a drag on the clip bar (see Help).
+        Menu {
+            name: "Clip".into(),
+            items: vec![
+                MenuItem::action(
+                    checked(
+                        state.tool == Tool::Select,
+                        "Select Tool — Pick & Drag Clips",
+                    ),
+                    SelectTool,
+                ),
+                MenuItem::action(
+                    checked(state.tool == Tool::Razor, "Razor Tool — Click to Cut"),
+                    RazorTool,
+                ),
+                MenuItem::separator(),
+                MenuItem::action("Cut at Playhead", SplitAtPlayhead),
+                MenuItem::action("Ripple Delete Selected Clips", DeleteClips),
             ],
         },
         Menu {
@@ -270,7 +316,7 @@ fn menus(state: MenuState) -> Vec<Menu> {
                 MenuItem::action("Zoom to Selection", ZoomToSelection),
                 MenuItem::action("Zoom In", ZoomIn),
                 MenuItem::action("Zoom Out", ZoomOut),
-                MenuItem::action("Show Entire File", ZoomToFit),
+                MenuItem::action("Show Entire Timeline", ZoomToFit),
             ],
         },
         Menu {
@@ -283,7 +329,7 @@ fn menus(state: MenuState) -> Vec<Menu> {
         Menu {
             name: "Help".into(),
             items: vec![
-                MenuItem::action("Keyboard & Gestures", ToggleHelp),
+                MenuItem::action("Editing Clips, Keyboard & Gestures", ToggleHelp),
                 MenuItem::separator(),
                 MenuItem::action("Sonora Source Code", SourceCode),
                 MenuItem::action("Report an Issue…", ReportIssue),
@@ -398,6 +444,12 @@ pub struct Sonora {
     updates: updater::Status,
     /// Loop the selection during preview. A session preference.
     looping: bool,
+    /// The pointer tool. A session preference, like the format.
+    tool: Tool,
+    /// Where the razor would cut (timeline seconds) while it hovers the stage.
+    razor_at: Option<f64>,
+    /// The pointer is over the clip bar (grab cursor with the Select tool).
+    lane_hover: bool,
     help: bool,
     /// A gain-track click that jumped the thumb: (before, after). A
     /// double-click that follows folds it into one "reset to 0 dB" step.
@@ -428,13 +480,32 @@ impl Drop for Import {
     }
 }
 
+/// One undo step: the arrangement and the trim/gain edit. The clip selection
+/// rides along so undo brings back what was selected, but selecting alone
+/// never creates a step.
+#[derive(Clone)]
+struct Snapshot {
+    edit: Edit,
+    timeline: Timeline,
+    selected: Vec<usize>,
+}
+
 pub(crate) struct Document {
     info: AudioInfo,
     name: String,
+    /// Trim and gain, in arranged-timeline seconds.
     edit: Edit,
-    undo: Vec<Edit>,
-    redo: Vec<Edit>,
-    /// Playhead while paused, absolute seconds.
+    /// The clips: source ranges of `info`, played back to back.
+    timeline: Timeline,
+    /// Bumped on every arrangement change; keys cached measurements.
+    revision: u64,
+    /// Selected clip indices, sorted and unique.
+    selected: Vec<usize>,
+    /// Where a ⇧-click range starts.
+    anchor: Option<usize>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// Playhead while paused, timeline seconds.
     cursor: f64,
     playing: bool,
     playable: bool,
@@ -450,11 +521,59 @@ pub(crate) struct Document {
     wave_cancel: Arc<AtomicBool>,
     _wave_task: Task<()>,
     export: Option<ExportJob>,
+    /// The trim range's peak, keyed by what it depends on, so painting
+    /// never rescans the overview.
+    peak_memo: Cell<Option<(PeakKey, Option<f32>)>>,
 }
 
+/// (trim start bits, trim end bits, arrangement revision, overview identity).
+type PeakKey = (u64, u64, u64, usize);
+
 impl Document {
+    fn new(info: AudioInfo, playable: bool, wave_cancel: Arc<AtomicBool>, task: Task<()>) -> Self {
+        Self {
+            name: display_name(info.source_path()),
+            edit: Edit::full(&info),
+            view: View::full(info.duration()),
+            timeline: Timeline::new(info.frames),
+            revision: 0,
+            selected: Vec::new(),
+            anchor: None,
+            info,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            cursor: 0.0,
+            playing: false,
+            playable,
+            original: false,
+            peaks: None,
+            peaks_exact: false,
+            wave_progress: 0.0,
+            wave_error: None,
+            wave_cancel,
+            _wave_task: task,
+            export: None,
+            peak_memo: Cell::new(None),
+        }
+    }
+
+    /// Length of the arranged timeline.
     fn duration(&self) -> f64 {
-        self.info.duration()
+        self.seconds(self.timeline.frames())
+    }
+
+    fn seconds(&self, frame: u64) -> f64 {
+        frame as f64 / self.info.sample_rate
+    }
+
+    /// The timeline frame nearest to `time`, inside the timeline.
+    fn frame_at(&self, time: f64) -> u64 {
+        ((time.max(0.0) * self.info.sample_rate).round() as u64).min(self.timeline.frames())
+    }
+
+    /// Whether any clip is left to play or export.
+    fn has_audio(&self) -> bool {
+        !self.timeline.is_empty()
     }
 
     fn preview_gain(&self) -> f32 {
@@ -462,7 +581,40 @@ impl Document {
     }
 
     fn is_edited(&self) -> bool {
-        self.edit != Edit::full(&self.info)
+        self.edit != Edit::full(&self.info) || !self.timeline.is_original()
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            edit: self.edit,
+            timeline: self.timeline.clone(),
+            selected: self.selected.clone(),
+        }
+    }
+
+    /// After the arrangement's length changed from `old_duration`: keep a
+    /// whole-file view whole, keep the playhead inside, re-key caches.
+    fn rearranged(&mut self, old_duration: f64) {
+        self.revision += 1;
+        let duration = self.duration();
+        self.view = if self.view.is_full(old_duration) || duration <= 0.0 {
+            View::full(duration)
+        } else {
+            View::fitted(self.view.start, self.view.end, duration)
+        };
+        self.cursor = self.cursor.clamp(0.0, duration);
+        self.anchor = self.anchor.filter(|&i| i < self.timeline.clips().len());
+    }
+
+    fn restore(&mut self, state: Snapshot) {
+        let old_duration = self.duration();
+        let moved = state.timeline != self.timeline;
+        self.edit = state.edit;
+        self.timeline = state.timeline;
+        self.selected = state.selected;
+        if moved {
+            self.rearranged(old_duration);
+        }
     }
 }
 
@@ -509,6 +661,22 @@ enum Drag {
         anchor: f64,
         anchor_x: f32,
         moved: bool,
+        /// A press that stays a click selects the clip under it.
+        click: Option<ClipClick>,
+    },
+    /// Dragging the selected clips along the clip bar.
+    Clips {
+        anchor_x: f32,
+        /// Pointer time minus the dragged block's start at the press.
+        grab: f64,
+        /// Pointer, timeline seconds.
+        pointer: f64,
+        moved: bool,
+        /// The boundary the block would drop at, when that changes anything.
+        target: Option<usize>,
+        /// A press on one clip of a multi-selection that never moves
+        /// narrows the selection to that clip, as in Finder.
+        collapse: Option<usize>,
     },
     Gain {
         origin: Edit,
@@ -520,6 +688,16 @@ enum Drag {
     },
     /// Dragging in the overview strip.
     Pan,
+}
+
+/// A click on a clip, with the modifiers that shape the selection.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClipClick {
+    pub index: usize,
+    /// ⌘: add or remove this clip.
+    pub toggle: bool,
+    /// ⇧: extend from the last clicked clip.
+    pub extend: bool,
 }
 
 impl Sonora {
@@ -546,6 +724,9 @@ impl Sonora {
             menu_state: MenuState::default(),
             updates: updater::Status::Development,
             looping: false,
+            tool: Tool::Select,
+            razor_at: None,
+            lane_hover: false,
             help: false,
             gain_click: None,
             _subscriptions: vec![activation],
@@ -601,6 +782,7 @@ impl Sonora {
         let state = MenuState {
             format: self.export_format(),
             automatic_updates: self.updates.is_ready().then(updater::automatic_checks),
+            tool: self.tool,
         };
         if state != self.menu_state {
             self.menu_state = state;
@@ -663,6 +845,8 @@ impl Sonora {
         let generation = self.generation;
         self.drag = None;
         self.hover = None;
+        self.razor_at = None;
+        self.lane_hover = false;
         self.notice = None;
         self.gain_click = None;
 
@@ -762,25 +946,12 @@ impl Sonora {
 
         let wave_cancel = Arc::new(AtomicBool::new(false));
         let wave_task = self.spawn_waveform(generation, info.clone(), wave_cancel.clone(), cx);
-        self.phase = Phase::Ready(Box::new(Document {
-            name: display_name(info.source_path()),
-            edit: Edit::full(&info),
-            view: View::full(info.duration()),
+        self.phase = Phase::Ready(Box::new(Document::new(
             info,
-            undo: Vec::new(),
-            redo: Vec::new(),
-            cursor: 0.0,
-            playing: false,
             playable,
-            original: false,
-            peaks: None,
-            peaks_exact: false,
-            wave_progress: 0.0,
-            wave_error: None,
             wave_cancel,
-            _wave_task: wave_task,
-            export: None,
-        }));
+            wave_task,
+        )));
         cx.notify();
     }
 
@@ -866,13 +1037,15 @@ impl Sonora {
         self.notice = None;
         self.drag = None;
         self.hover = None;
+        self.razor_at = None;
+        self.lane_hover = false;
         self.gain_click = None;
         cx.notify();
     }
 
     // ---- Playback ------------------------------------------------------
 
-    /// Current playhead, absolute seconds.
+    /// Current playhead, timeline seconds.
     fn position(&self) -> f64 {
         match (self.doc(), &self.player) {
             (Some(doc), Some(player)) if doc.playing => player.position(),
@@ -890,12 +1063,28 @@ impl Sonora {
         }
     }
 
+    /// Plays the arrangement from `from` to the trim end. The engine queues
+    /// every join itself, so clips follow each other without a gap.
+    fn play_from(player: &mut Player, doc: &Document, from: f64) -> anyhow::Result<()> {
+        player.play_timeline(
+            &doc.info,
+            &doc.timeline,
+            from,
+            doc.edit.end,
+            doc.preview_gain(),
+        )
+    }
+
     fn toggle_playback(&mut self, cx: &mut Context<Self>) {
         let position = self.position();
         let Phase::Ready(doc) = &mut self.phase else {
             return;
         };
-        let Some(player) = self.player.as_mut().filter(|_| doc.playable) else {
+        let Some(player) = self
+            .player
+            .as_mut()
+            .filter(|_| doc.playable && doc.has_audio())
+        else {
             return;
         };
         if doc.playing {
@@ -909,7 +1098,7 @@ impl Sonora {
             } else {
                 start
             };
-            match player.play(from, end, doc.preview_gain()) {
+            match Self::play_from(player, doc, from) {
                 Ok(()) => {
                     doc.playing = true;
                     doc.cursor = from;
@@ -934,7 +1123,7 @@ impl Sonora {
             let Edit { start, end, .. } = doc.edit;
             let from = time.clamp(start, (end - 0.01).max(start));
             doc.cursor = from;
-            if let Err(err) = player.play(from, end, doc.preview_gain()) {
+            if let Err(err) = Self::play_from(player, doc, from) {
                 doc.playing = false;
                 self.notice = Some(Notice::Error(format!("Couldn't play. {}", sentence(&err))));
             }
@@ -950,8 +1139,9 @@ impl Sonora {
     }
 
     /// After an edit, follow the new gain and keep playback inside the
-    /// (possibly new) selection.
-    fn sync_playback(&mut self, before: Edit) {
+    /// (possibly new) selection. `resume` is set when the arrangement itself
+    /// changed: the engine's queue is rebuilt from that timeline position.
+    fn sync_playback(&mut self, before: Edit, resume: Option<f64>) {
         let Phase::Ready(doc) = &mut self.phase else {
             return;
         };
@@ -959,14 +1149,13 @@ impl Sonora {
             return;
         };
         let Edit { start, end, .. } = doc.edit;
-        let gain = doc.preview_gain();
-        player.set_gain(gain);
-        if !doc.playing || (start == before.start && end == before.end) {
+        player.set_gain(doc.preview_gain());
+        if !doc.playing || (resume.is_none() && start == before.start && end == before.end) {
             return;
         }
-        let at = player.position();
-        if at >= start && at < end - 0.01 {
-            if player.play(at, end, gain).is_err() {
+        let at = resume.unwrap_or_else(|| player.position());
+        if doc.has_audio() && at >= start && at < end - 0.01 {
+            if Self::play_from(player, doc, at).is_err() {
                 player.pause();
                 doc.playing = false;
                 doc.cursor = at;
@@ -994,10 +1183,8 @@ impl Sonora {
             return false;
         };
         let mut alive = player.is_playing();
-        if !alive && looping {
-            alive = player
-                .play(doc.edit.start, doc.edit.end, doc.preview_gain())
-                .is_ok();
+        if !alive && looping && doc.has_audio() {
+            alive = Self::play_from(player, doc, doc.edit.start).is_ok();
         }
         if !alive {
             doc.playing = false;
@@ -1027,8 +1214,10 @@ impl Sonora {
 
     // ---- Edits ---------------------------------------------------------
 
-    fn record(doc: &mut Document, before: Edit) {
-        if doc.edit != before {
+    /// Pushes `before` as one undo step if the edit or the arrangement
+    /// changed since.
+    fn record(doc: &mut Document, before: Snapshot) {
+        if doc.edit != before.edit || doc.timeline != before.timeline {
             doc.undo.push(before);
             if doc.undo.len() > UNDO_LIMIT {
                 doc.undo.remove(0);
@@ -1037,39 +1226,67 @@ impl Sonora {
         }
     }
 
-    /// Applies a discrete edit as one undo step.
+    /// Records an arrangement change made since `before` and rebuilds
+    /// playback from `resume` when the audio under the playhead changed.
+    fn commit(&mut self, before: Snapshot, resume: Option<f64>, cx: &mut Context<Self>) {
+        let edit = before.edit;
+        let Some(doc) = self.doc_mut() else { return };
+        Self::record(doc, before);
+        self.sync_playback(edit, resume);
+        cx.notify();
+    }
+
+    /// Applies a discrete trim or gain edit as one undo step.
     fn apply_edit(&mut self, edit: Edit, cx: &mut Context<Self>) {
         let Some(doc) = self.doc_mut() else { return };
-        if edit.validate(&doc.info).is_err() {
+        if edit
+            .validate_frames(doc.timeline.frames(), doc.info.sample_rate)
+            .is_err()
+        {
             return;
         }
         let before = doc.edit;
+        // Even an unchanged edit re-syncs the engine below (the gain
+        // double-click fold relies on it).
+        let snapshot = doc.snapshot();
         doc.edit = edit;
-        Self::record(doc, before);
-        self.sync_playback(before);
+        Self::record(doc, snapshot);
+        self.sync_playback(before, None);
+        cx.notify();
+    }
+
+    /// Undo (`forward == false`) or redo one step: trim, gain, cuts,
+    /// deletes and moves alike.
+    fn step_history(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let position = self.position();
+        let Some(doc) = self.doc_mut() else { return };
+        let Some(target) = (if forward {
+            doc.redo.pop()
+        } else {
+            doc.undo.pop()
+        }) else {
+            return;
+        };
+        let current = doc.snapshot();
+        let before = current.edit;
+        let rearranged = target.timeline != doc.timeline;
+        if forward {
+            doc.undo.push(current);
+        } else {
+            doc.redo.push(current);
+        }
+        doc.restore(target);
+        let resume = rearranged.then(|| position.min(doc.duration()));
+        self.sync_playback(before, resume);
         cx.notify();
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
-        let Some(doc) = self.doc_mut() else { return };
-        let Some(previous) = doc.undo.pop() else {
-            return;
-        };
-        let before = doc.edit;
-        doc.redo.push(before);
-        doc.edit = previous;
-        self.sync_playback(before);
-        cx.notify();
+        self.step_history(false, cx);
     }
 
     fn redo(&mut self, cx: &mut Context<Self>) {
-        let Some(doc) = self.doc_mut() else { return };
-        let Some(next) = doc.redo.pop() else { return };
-        let before = doc.edit;
-        doc.undo.push(before);
-        doc.edit = next;
-        self.sync_playback(before);
-        cx.notify();
+        self.step_history(true, cx);
     }
 
     fn set_in(&mut self, cx: &mut Context<Self>) {
@@ -1086,7 +1303,7 @@ impl Sonora {
         self.apply_edit(edit, cx);
     }
 
-    /// Sends one trim edge back to the file boundary (double-click on a
+    /// Sends one trim edge back to the timeline boundary (double-click on a
     /// handle, ⇧I, ⇧O). The other edge and the gain are untouched.
     fn reset_edge(&mut self, handle: Handle, cx: &mut Context<Self>) {
         self.drag = None;
@@ -1095,19 +1312,22 @@ impl Sonora {
         self.apply_edit(edit, cx);
     }
 
-    fn select_all(&mut self, cx: &mut Context<Self>) {
-        let Some(doc) = self.doc() else { return };
-        let edit = Edit {
-            gain_db: doc.edit.gain_db,
-            ..Edit::full(&doc.info)
-        };
-        self.apply_edit(edit, cx);
-    }
-
+    /// Back to the untouched source: one clip, whole-file trim, 0 dB. One
+    /// undo step, so even an emptied timeline is a click away from either.
     fn reset_edits(&mut self, cx: &mut Context<Self>) {
-        let Some(doc) = self.doc() else { return };
-        let full = Edit::full(&doc.info);
-        self.apply_edit(full, cx);
+        let position = self.position();
+        let Some(doc) = self.doc_mut().filter(|d| d.is_edited()) else {
+            return;
+        };
+        let before = doc.snapshot();
+        let old_duration = doc.duration();
+        doc.timeline.reset();
+        doc.selected.clear();
+        doc.anchor = None;
+        doc.rearranged(old_duration);
+        doc.edit = Edit::full(&doc.info);
+        let resume = position.min(doc.duration());
+        self.commit(before, Some(resume), cx);
     }
 
     fn reset_gain(&mut self, cx: &mut Context<Self>) {
@@ -1139,10 +1359,119 @@ impl Sonora {
         cx.notify();
     }
 
+    // ---- Clips ---------------------------------------------------------
+
+    fn set_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        if self.tool != tool {
+            self.tool = tool;
+            self.razor_at = None;
+            self.hover = None;
+            cx.notify();
+        }
+    }
+
+    /// Cuts the clip under `time` (timeline seconds) at the nearest sample
+    /// frame. Nothing happens on an existing join or past the end.
+    fn split_at(&mut self, time: f64, cx: &mut Context<Self>) {
+        let Some(doc) = self.doc_mut().filter(|d| d.has_audio()) else {
+            return;
+        };
+        let before = doc.snapshot();
+        let Some(right) = doc.timeline.split(doc.frame_at(time)) else {
+            return;
+        };
+        doc.selected = logic::selection_after_split(&doc.selected, right);
+        doc.anchor = doc.anchor.map(|a| if a >= right { a + 1 } else { a });
+        doc.revision += 1;
+        // The audio is unchanged, so playback carries on untouched.
+        self.commit(before, None, cx);
+    }
+
+    fn split_at_playhead(&mut self, cx: &mut Context<Self>) {
+        let at = self.position();
+        self.split_at(at, cx);
+    }
+
+    /// Ripple delete: the selected clips go and later ones close the gap.
+    /// Trim edges and the playhead keep pointing at the same audio.
+    fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        let position = self.position();
+        let Some(doc) = self.doc_mut().filter(|d| !d.selected.is_empty()) else {
+            return;
+        };
+        let before = doc.snapshot();
+        let old_duration = doc.duration();
+        let deleted = std::mem::take(&mut doc.selected);
+        let rate = doc.info.sample_rate;
+        let ripple = |time: f64| logic::ripple_time(&before.timeline, &deleted, time, rate);
+        let (cursor, resume) = (ripple(doc.cursor), ripple(position));
+        let edit = logic::edit_after_delete(doc.edit, &before.timeline, &deleted, rate);
+        doc.timeline.delete(&deleted);
+        doc.anchor = None;
+        doc.rearranged(old_duration);
+        doc.cursor = cursor.min(doc.duration());
+        doc.edit = edit;
+        self.commit(before, Some(resume), cx);
+    }
+
+    /// Moves the selected clips, in order, to a boundary of the arrangement.
+    fn move_selection(&mut self, boundary: usize, cx: &mut Context<Self>) {
+        let position = self.position();
+        let Some(doc) = self.doc_mut() else { return };
+        let before = doc.snapshot();
+        let picked = doc.selected.clone();
+        let Some(moved) = doc.timeline.move_clips(&picked, boundary) else {
+            return;
+        };
+        doc.anchor = Some(moved.start);
+        doc.selected = moved.collect();
+        doc.revision += 1;
+        // Same length; the playhead stays put while the audio under it moves.
+        self.commit(before, Some(position), cx);
+    }
+
+    fn click_clip(&mut self, click: ClipClick, cx: &mut Context<Self>) {
+        let Some(doc) = self.doc_mut() else { return };
+        let (selected, anchor) = logic::click_selection(
+            &doc.selected,
+            doc.anchor,
+            click.index,
+            click.toggle,
+            click.extend,
+        );
+        doc.selected = selected;
+        doc.anchor = anchor;
+        cx.notify();
+    }
+
+    fn select_all_clips(&mut self, cx: &mut Context<Self>) {
+        let Some(doc) = self.doc_mut().filter(|d| d.has_audio()) else {
+            return;
+        };
+        doc.selected = (0..doc.timeline.clips().len()).collect();
+        doc.anchor = Some(0);
+        cx.notify();
+    }
+
+    fn deselect_clips(&mut self, cx: &mut Context<Self>) {
+        if let Some(doc) = self.doc_mut() {
+            doc.selected.clear();
+            doc.anchor = None;
+            cx.notify();
+        }
+    }
+
+    /// The clip under a timeline time.
+    fn clip_at(&self, time: f64) -> Option<usize> {
+        let doc = self.doc()?;
+        doc.timeline.clip_at(doc.frame_at(time))
+    }
+
     // ---- View ----------------------------------------------------------
 
     fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         if let Some(doc) = self.doc_mut()
+            && doc.has_audio()
             && doc.view != view
         {
             doc.view = view;
@@ -1204,15 +1533,75 @@ impl Sonora {
         cx.notify();
     }
 
-    fn begin_range_drag(&mut self, time: f64, x: f32, cx: &mut Context<Self>) {
+    /// `click`: the clip to select if this press never becomes a drag.
+    fn begin_range_drag(
+        &mut self,
+        time: f64,
+        x: f32,
+        click: Option<ClipClick>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(doc) = self.doc() else { return };
         self.drag = Some(Drag::Range {
             origin: doc.edit,
             anchor: time,
             anchor_x: x,
             moved: false,
+            click,
         });
         self.seek_to(time, cx);
+    }
+
+    /// A press on the clip bar with the Select tool: ⌘/⇧ adjust the
+    /// selection; a plain press selects the clip and arms a reorder drag of
+    /// everything selected.
+    fn press_clip(
+        &mut self,
+        time: f64,
+        x: f32,
+        toggle: bool,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.clip_at(time) else {
+            return;
+        };
+        if toggle || extend {
+            self.click_clip(
+                ClipClick {
+                    index,
+                    toggle,
+                    extend,
+                },
+                cx,
+            );
+            return;
+        }
+        let Some(doc) = self.doc_mut() else { return };
+        let collapse = (doc.selected.len() > 1 && doc.selected.contains(&index)).then_some(index);
+        if !doc.selected.contains(&index) {
+            doc.selected = vec![index];
+        }
+        doc.anchor = Some(index);
+        // The dragged block is the selection gathered in order; keep the
+        // pointer where it grabbed the pressed clip within that block.
+        let clips = doc.timeline.clips();
+        let ahead: u64 = doc
+            .selected
+            .iter()
+            .filter(|&&i| i < index)
+            .map(|&i| clips[i].frames())
+            .sum();
+        let grab = time - doc.seconds(doc.timeline.boundary_frame(index)) + doc.seconds(ahead);
+        self.drag = Some(Drag::Clips {
+            anchor_x: x,
+            grab,
+            pointer: time,
+            moved: false,
+            target: None,
+            collapse,
+        });
+        cx.notify();
     }
 
     fn begin_pan(&mut self, time: f64, cx: &mut Context<Self>) {
@@ -1225,7 +1614,10 @@ impl Sonora {
     /// `jump`: the track was pressed away from the thumb, so the gain moves
     /// there at once. Otherwise the thumb was grabbed and keeps its offset.
     fn begin_gain_drag(&mut self, jump: Option<f32>, pointer: f32, cx: &mut Context<Self>) {
-        let Some(doc) = self.doc() else { return };
+        // An emptied timeline has no valid edit to change the gain of.
+        let Some(doc) = self.doc().filter(|d| d.has_audio()) else {
+            return;
+        };
         let origin = doc.edit;
         self.gain_click = None;
         match jump {
@@ -1279,7 +1671,10 @@ impl Sonora {
         let Some(doc) = self.doc_mut() else { return };
         if let Some((before, after)) = click
             && doc.edit == after
-            && doc.undo.last() == Some(&before)
+            && doc
+                .undo
+                .last()
+                .is_some_and(|s| s.edit == before && s.timeline == doc.timeline)
         {
             doc.undo.pop();
             doc.edit = before;
@@ -1326,6 +1721,24 @@ impl Sonora {
                     doc.edit.end = b;
                 }
             }
+            Drag::Clips {
+                anchor_x,
+                pointer,
+                moved,
+                target,
+                ..
+            } => {
+                if !*moved && (x - *anchor_x).abs() < CLIP_SLOP {
+                    return;
+                }
+                *moved = true;
+                *pointer = time;
+                // Snap to the join nearest the pointer; joins that would
+                // leave the order as it is show no indicator.
+                let boundary = doc.timeline.nearest_boundary(doc.frame_at(time));
+                let mut trial = doc.timeline.clone();
+                *target = trial.move_clips(&doc.selected, boundary).map(|_| boundary);
+            }
             Drag::Pan => {
                 doc.view = doc.view.centered_on(full_time, duration);
             }
@@ -1340,16 +1753,47 @@ impl Sonora {
             Drag::Handle { origin, .. }
             | Drag::Range { origin, .. }
             | Drag::Gain { origin, .. } => origin,
+            Drag::Clips {
+                moved,
+                target,
+                collapse,
+                ..
+            } => {
+                if let Some(boundary) = target.filter(|_| moved) {
+                    self.move_selection(boundary, cx);
+                } else if let Some(index) = collapse.filter(|_| !moved) {
+                    self.click_clip(
+                        ClipClick {
+                            index,
+                            toggle: false,
+                            extend: false,
+                        },
+                        cx,
+                    );
+                }
+                cx.notify();
+                return;
+            }
             Drag::Pan => {
                 cx.notify();
                 return;
             }
         };
         if let Some(doc) = self.doc_mut() {
-            if doc.edit.validate(&doc.info).is_err() {
+            if doc
+                .edit
+                .validate_frames(doc.timeline.frames(), doc.info.sample_rate)
+                .is_err()
+            {
                 doc.edit = origin;
             }
-            Self::record(doc, origin);
+            if doc.edit != origin {
+                let before = Snapshot {
+                    edit: origin,
+                    ..doc.snapshot()
+                };
+                Self::record(doc, before);
+            }
             // Keep a fresh range's playhead at its start.
             if let Drag::Range { moved: true, .. } = drag
                 && !doc.playing
@@ -1365,14 +1809,34 @@ impl Sonora {
                 self.gain_click = Some((origin, doc.edit));
             }
         }
+        // A click (not a drag) in the waveform also selects the clip under it.
+        if let Drag::Range {
+            moved: false,
+            click: Some(click),
+            ..
+        } = drag
+        {
+            self.click_clip(click, cx);
+        }
         // Gain already followed live; this reschedules a changed selection.
-        self.sync_playback(origin);
+        self.sync_playback(origin, None);
         cx.notify();
     }
 
     fn set_hover(&mut self, hover: Option<Handle>, cx: &mut Context<Self>) {
         if self.hover != hover {
             self.hover = hover;
+            cx.notify();
+        }
+    }
+
+    /// Pointer feedback over the stage: the razor line (Razor tool only) and
+    /// whether the clip bar is under the pointer.
+    fn set_pointer(&mut self, razor: Option<f64>, lane: bool, cx: &mut Context<Self>) {
+        let razor = razor.filter(|_| self.tool == Tool::Razor);
+        if self.razor_at != razor || self.lane_hover != lane {
+            self.razor_at = razor;
+            self.lane_hover = lane;
             cx.notify();
         }
     }
@@ -1384,7 +1848,9 @@ impl Sonora {
             return;
         }
         let format = self.export_format();
-        let Some(doc) = self.doc() else { return };
+        let Some(doc) = self.doc().filter(|d| d.has_audio()) else {
+            return;
+        };
         if doc.export.is_some() {
             return;
         }
@@ -1422,7 +1888,9 @@ impl Sonora {
         let destination = logic::with_format_extension(destination, format);
         let generation = self.generation;
         let Some(doc) = self.doc() else { return };
-        let (info, edit) = (doc.info.clone(), doc.edit);
+        // The job owns its copy of the arrangement (source ranges only), so
+        // edits made while it runs never change what it writes.
+        let (info, edit, timeline) = (doc.info.clone(), doc.edit, doc.timeline.clone());
 
         // Never write over the dropped original, nor over the extracted
         // audio that backs a video import.
@@ -1454,7 +1922,14 @@ impl Sonora {
             );
             return;
         }
-        if let Err(err) = edit.validate(&info) {
+        if timeline.is_empty() {
+            self.error(
+                "Nothing to export — every clip was deleted. Undo or reset.",
+                cx,
+            );
+            return;
+        }
+        if let Err(err) = edit.validate_frames(timeline.frames(), info.sample_rate) {
             self.error(
                 format!("Can't export this selection. {}", sentence(&err)),
                 cx,
@@ -1469,8 +1944,15 @@ impl Sonora {
             let (cancel, progress, finished) = (cancel.clone(), progress.clone(), finished.clone());
             let destination = destination.clone();
             async move {
-                let result =
-                    audio::export_audio(&info, edit, &destination, format, &cancel, &progress);
+                let result = audio::export_timeline(
+                    &info,
+                    &timeline,
+                    edit,
+                    &destination,
+                    format,
+                    &cancel,
+                    &progress,
+                );
                 finished.store(true, Ordering::Release);
                 result
             }
@@ -1548,6 +2030,13 @@ impl Sonora {
         } else if let Some(job) = self.doc().and_then(|doc| doc.export.as_ref()) {
             job.cancel.store(true, Ordering::Relaxed);
             cx.notify();
+        } else if matches!(self.drag, Some(Drag::Clips { .. })) {
+            self.drag = None;
+            cx.notify();
+        } else if self.tool == Tool::Razor || self.doc().is_some_and(|d| !d.selected.is_empty()) {
+            // Back to a neutral state: Select tool, nothing selected.
+            self.set_tool(Tool::Select, cx);
+            self.deselect_clips(cx);
         } else if self.notice.is_some() {
             self.notice = None;
             cx.notify();

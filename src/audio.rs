@@ -65,6 +65,16 @@ unsafe extern "C" {
         err: *mut c_char,
         cap: usize,
     ) -> i32;
+    fn sonora_player_play_ranges(
+        player: *mut c_void,
+        starts: *const u64,
+        ends: *const u64,
+        count: usize,
+        timeline_start: f64,
+        db: f32,
+        err: *mut c_char,
+        cap: usize,
+    ) -> i32;
     fn sonora_player_pause(player: *mut c_void);
     fn sonora_player_stop(player: *mut c_void);
     fn sonora_player_gain(player: *mut c_void, db: f32);
@@ -418,12 +428,18 @@ impl Edit {
         }
     }
     pub fn validate(&self, info: &AudioInfo) -> Result<()> {
+        self.validate_frames(info.frames, info.sample_rate)
+    }
+    /// Validates against a length in frames, such as an arranged timeline.
+    pub fn validate_frames(&self, frames: u64, sample_rate: f64) -> Result<()> {
         ensure!(
             self.start.is_finite() && self.end.is_finite() && self.gain_db.is_finite(),
             "Invalid edit values"
         );
         ensure!(
-            self.start >= 0. && self.end <= info.duration() + 1e-6 && self.end > self.start,
+            self.start >= 0.
+                && self.end <= frames as f64 / sample_rate + 1e-6
+                && self.end > self.start,
             "Choose a non-empty range within this recording"
         );
         ensure!(
@@ -431,10 +447,15 @@ impl Edit {
             "Gain must be between -24 and +24 dB"
         );
         ensure!(
-            (self.end * info.sample_rate).round() > (self.start * info.sample_rate).round(),
+            (self.end * sample_rate).round() > (self.start * sample_rate).round(),
             "Selection must contain at least one sample"
         );
         Ok(())
+    }
+    /// The selected frames, rounded to the nearest sample and clamped to `frames`.
+    pub fn frame_range(&self, sample_rate: f64, frames: u64) -> std::ops::Range<u64> {
+        let first = (self.start * sample_rate).round() as u64;
+        first..((self.end * sample_rate).round() as u64).min(frames)
     }
 }
 pub struct Player {
@@ -474,6 +495,49 @@ impl Player {
                     start,
                     end,
                     gain_db.clamp(-24., 24.),
+                    err.as_mut_ptr(),
+                    err.len(),
+                )
+            } == 0,
+            "{}",
+            message(&err)
+        );
+        Ok(())
+    }
+    /// Play arranged source clips continuously, reporting position in timeline seconds.
+    pub fn play_timeline(
+        &mut self,
+        info: &AudioInfo,
+        timeline: &crate::timeline::Timeline,
+        start: f64,
+        end: f64,
+        gain_db: f32,
+    ) -> Result<()> {
+        ensure!(
+            timeline.source_frames() == info.frames,
+            "Arrangement belongs to a different source"
+        );
+        let edit = Edit {
+            start,
+            end,
+            gain_db,
+        };
+        edit.validate_frames(timeline.frames(), info.sample_rate)?;
+        let frames = edit.frame_range(info.sample_rate, timeline.frames());
+        let first = frames.start;
+        let ranges = timeline.ranges(frames);
+        let starts: Vec<_> = ranges.iter().map(|r| r.start).collect();
+        let ends: Vec<_> = ranges.iter().map(|r| r.end).collect();
+        let mut err = [0; 1024];
+        ensure!(
+            unsafe {
+                sonora_player_play_ranges(
+                    self.ptr,
+                    starts.as_ptr(),
+                    ends.as_ptr(),
+                    starts.len(),
+                    first as f64 / info.sample_rate,
+                    gain_db,
                     err.as_mut_ptr(),
                     err.len(),
                 )
@@ -630,6 +694,33 @@ impl Drop for CompressedWriter {
         }
     }
 }
+/// Streams the trimmed arrangement in clip order; editing never materializes PCM.
+pub fn export_timeline(
+    info: &AudioInfo,
+    timeline: &crate::timeline::Timeline,
+    edit: Edit,
+    destination: &Path,
+    format: ExportFormat,
+    cancel: &AtomicBool,
+    progress: &AtomicU32,
+) -> Result<()> {
+    ensure!(
+        timeline.source_frames() == info.frames,
+        "Arrangement belongs to a different source"
+    );
+    edit.validate_frames(timeline.frames(), info.sample_rate)?;
+    let ranges = timeline.ranges(edit.frame_range(info.sample_rate, timeline.frames()));
+    export_ranges(
+        info,
+        &ranges,
+        edit.gain_db,
+        destination,
+        format,
+        cancel,
+        progress,
+    )
+}
+
 /// Streams edited PCM into a real WAV, MP3 or AAC/M4A encoder. No external
 /// process, full-file intermediate, or unbounded PCM allocation is used.
 pub fn export_audio(
@@ -640,10 +731,35 @@ pub fn export_audio(
     cancel: &AtomicBool,
     progress: &AtomicU32,
 ) -> Result<()> {
-    if format == ExportFormat::Wav {
-        return export_wav(info, edit, destination, cancel, progress);
-    }
     edit.validate(info)?;
+    let frames = edit.frame_range(info.sample_rate, info.frames);
+    let ranges = [crate::timeline::Clip {
+        start: frames.start,
+        end: frames.end,
+    }];
+    export_ranges(
+        info,
+        &ranges,
+        edit.gain_db,
+        destination,
+        format,
+        cancel,
+        progress,
+    )
+}
+
+fn export_ranges(
+    info: &AudioInfo,
+    ranges: &[crate::timeline::Clip],
+    gain_db: f32,
+    destination: &Path,
+    format: ExportFormat,
+    cancel: &AtomicBool,
+    progress: &AtomicU32,
+) -> Result<()> {
+    if format == ExportFormat::Wav {
+        return export_wav_ranges(info, ranges, gain_db, destination, cancel, progress);
+    }
     ensure!(
         info.channels <= 2,
         "MP3 and M4A support mono or stereo. Choose WAV for multichannel audio."
@@ -670,9 +786,7 @@ pub fn export_audio(
         destination != fs::canonicalize(&info.path)?,
         "The source cannot be overwritten"
     );
-    let first = (edit.start * info.sample_rate).round() as u64;
-    let end = ((edit.end * info.sample_rate).round() as u64).min(info.frames);
-    let frames = end - first;
+    let frames: u64 = ranges.iter().map(|r| r.frames()).sum();
     let mut reader = Reader::open(&info.path)?;
     ensure!(
         reader.info.frames == info.frames
@@ -680,7 +794,6 @@ pub fn export_audio(
             && reader.info.sample_rate == info.sample_rate,
         "Source changed; reopen it before exporting"
     );
-    reader.seek(first)?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let temp = TempOutput(parent.join(format!(
         ".sonora-{}-{stamp}.{}",
@@ -699,26 +812,30 @@ pub fn export_audio(
     let mut writer = CompressedWriter::new(&temp.0, info, frames, format)?;
     let channels = info.channels as usize;
     let mut buffer = vec![0.; CHUNK * channels];
-    let gain = 10f32.powf(edit.gain_db / 20.);
+    let gain = 10f32.powf(gain_db / 20.);
     let mut done = 0u64;
     progress.store(0, Ordering::Relaxed);
-    while done < frames {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("Export cancelled");
+    for range in ranges {
+        reader.seek(range.start)?;
+        let stop = done + range.frames();
+        while done < stop {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("Export cancelled");
+            }
+            let want = (stop - done).min(CHUNK as u64) as usize;
+            let n = reader.read(&mut buffer[..want * channels])?;
+            ensure!(n > 0, "Source ended early; no output was saved");
+            for value in &mut buffer[..n * channels] {
+                *value = if value.is_finite() {
+                    (*value * gain).clamp(-1., 1.)
+                } else {
+                    0.
+                };
+            }
+            writer.write(&buffer[..n * channels], n)?;
+            done += n as u64;
+            progress.store((done * 990 / frames) as u32, Ordering::Relaxed);
         }
-        let want = (frames - done).min(CHUNK as u64) as usize;
-        let n = reader.read(&mut buffer[..want * channels])?;
-        ensure!(n > 0, "Source ended early; no output was saved");
-        for value in &mut buffer[..n * channels] {
-            *value = if value.is_finite() {
-                (*value * gain).clamp(-1., 1.)
-            } else {
-                0.
-            };
-        }
-        writer.write(&buffer[..n * channels], n)?;
-        done += n as u64;
-        progress.store((done * 990 / frames) as u32, Ordering::Relaxed);
     }
     writer.finish()?;
     File::open(&temp.0)?.sync_all()?;
@@ -738,7 +855,17 @@ pub fn export_wav(
     cancel: &AtomicBool,
     progress: &AtomicU32,
 ) -> Result<()> {
-    edit.validate(info)?;
+    export_audio(info, edit, destination, ExportFormat::Wav, cancel, progress)
+}
+
+fn export_wav_ranges(
+    info: &AudioInfo,
+    ranges: &[crate::timeline::Clip],
+    gain_db: f32,
+    destination: &Path,
+    cancel: &AtomicBool,
+    progress: &AtomicU32,
+) -> Result<()> {
     ensure!(
         !destination.exists(),
         "This destination already exists. Choose a new name; originals are never overwritten."
@@ -758,9 +885,7 @@ pub fn export_wav(
         destination != fs::canonicalize(&info.path)?,
         "The source cannot be overwritten"
     );
-    let first = (edit.start * info.sample_rate).round() as u64;
-    let end = ((edit.end * info.sample_rate).round() as u64).min(info.frames);
-    let frames = end - first;
+    let frames: u64 = ranges.iter().map(|r| r.frames()).sum();
     let header = wav_header(
         frames,
         info.sample_rate.round() as u32,
@@ -783,27 +908,30 @@ pub fn export_wav(
             && reader.info.sample_rate == info.sample_rate,
         "Source changed; reopen it before exporting"
     );
-    reader.seek(first)?;
     let channels = info.channels as usize;
     let mut buffer = vec![0.; CHUNK * channels];
     let mut encoded = Vec::with_capacity(CHUNK * channels * 3);
-    let gain = 10f32.powf(edit.gain_db / 20.);
+    let gain = 10f32.powf(gain_db / 20.);
     let mut done = 0;
     progress.store(0, Ordering::Relaxed);
-    while done < frames {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("Export cancelled")
+    for range in ranges {
+        reader.seek(range.start)?;
+        let stop = done + range.frames();
+        while done < stop {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("Export cancelled")
+            }
+            let want = ((stop - done) as usize).min(CHUNK);
+            let n = reader.read(&mut buffer[..want * channels])?;
+            ensure!(n > 0, "Source ended early; no output was saved");
+            encoded.clear();
+            for &s in &buffer[..n * channels] {
+                encoded.extend(pcm24(s, gain))
+            }
+            out.write_all(&encoded)?;
+            done += n as u64;
+            progress.store((done * 1000 / frames) as u32, Ordering::Relaxed);
         }
-        let want = ((frames - done) as usize).min(CHUNK);
-        let n = reader.read(&mut buffer[..want * channels])?;
-        ensure!(n > 0, "Source ended early; no output was saved");
-        encoded.clear();
-        for &s in &buffer[..n * channels] {
-            encoded.extend(pcm24(s, gain))
-        }
-        out.write_all(&encoded)?;
-        done += n as u64;
-        progress.store((done * 1000 / frames) as u32, Ordering::Relaxed);
     }
     if frames * channels as u64 * 3 % 2 == 1 {
         out.write_all(&[0])?
@@ -916,6 +1044,78 @@ mod pipeline_tests {
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
+    #[test]
+    fn arranged_export_matches_reordered_source_samples() {
+        let fixture = Fixture::new(48000);
+        let original = fs::read(&fixture.source).unwrap();
+        let info = probe(&fixture.source).unwrap();
+        let mut timeline = crate::timeline::Timeline::new(info.frames);
+        timeline.split(12000);
+        timeline.split(24000);
+        timeline.split(36000);
+        timeline.delete(&[1]);
+        timeline.move_clip(2, 0);
+        // Arrangement: source [36000..48000, 0..12000, 24000..36000].
+        let edit = Edit {
+            start: 0.125,
+            end: 0.625,
+            gain_db: 6.0,
+        };
+        let output = fixture.dir.join("arranged.wav");
+        export_timeline(
+            &info,
+            &timeline,
+            edit,
+            &output,
+            ExportFormat::Wav,
+            &AtomicBool::new(false),
+            &AtomicU32::new(0),
+        )
+        .unwrap();
+        let result = probe(&output).unwrap();
+        assert_eq!(result.frames, 24000);
+        let mut reader = Reader::open(&output).unwrap();
+        let mut samples = vec![0.0; 48000];
+        assert_eq!(reader.read(&mut samples).unwrap(), 24000);
+        let gain = 10f32.powf(6.0 / 20.0);
+        for (i, pair) in samples.as_chunks::<2>().0.iter().enumerate() {
+            let source = timeline.source_frame(6000 + i as u64).unwrap();
+            let expected =
+                (source as f32 * std::f32::consts::TAU * 440.0 / 48000.0).sin() * 0.2 * gain;
+            assert!((pair[0] - expected).abs() < 0.000001, "frame {i}");
+            assert!((pair[1] + expected * 0.5).abs() < 0.000001, "frame {i}");
+        }
+        assert_eq!(fs::read(&fixture.source).unwrap(), original);
+        for format in [ExportFormat::Mp3, ExportFormat::M4a] {
+            let path = fixture.dir.join(format!("arranged.{}", format.extension()));
+            export_timeline(
+                &info,
+                &timeline,
+                edit,
+                &path,
+                format,
+                &AtomicBool::new(false),
+                &AtomicU32::new(0),
+            )
+            .unwrap();
+            let result = probe(&path).unwrap();
+            assert!((result.duration() - 0.5).abs() < 0.1);
+        }
+        timeline.delete(&[0, 1, 2]);
+        assert!(
+            export_timeline(
+                &info,
+                &timeline,
+                edit,
+                &fixture.dir.join("empty.wav"),
+                ExportFormat::Wav,
+                &AtomicBool::new(false),
+                &AtomicU32::new(0)
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn native_trim_gain_and_source_preservation() {
         let fixture = Fixture::new(48000);

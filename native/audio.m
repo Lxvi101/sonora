@@ -59,13 +59,86 @@ void sonora_reader_close(void *ptr) { Reader *r = ptr; if (r) { ExtAudioFileDisp
 @property double end;
 @property double paused;
 @property BOOL running;
+// Arranged playback. `generation` (atomic; written only on the main thread)
+// invalidates earlier schedules. Everything below it is touched only on
+// `queue`, the one place segments are scheduled from.
+@property uint64_t generation;
+@property dispatch_queue_t queue;
+@property AVAudioFile *scheduledFile;
+@property NSData *ranges;
+@property NSUInteger next;
+@property uint64_t nextFrame;
+@property NSUInteger queued;
+@property uint64_t queuedFrames;
 @end
 @implementation SonoraPlayer
 @end
+
+// Bounded look-ahead: a few seconds or segments, never the whole arrangement.
+static const NSUInteger SONORA_MAX_QUEUED = 256;
+static const double SONORA_AHEAD_SECONDS = 2.0;
+
+// Runs on p.queue. Each consumed segment schedules more, so joins are queued
+// back to back on the node long before they play.
+static void sonora_schedule_more(SonoraPlayer *p, uint64_t generation) {
+    // Uses the file captured with this schedule, never `p.file`, which the
+    // main thread may replace once the schedule has been forgotten.
+    AVAudioFile *file = p.scheduledFile;
+    NSData *ranges = p.ranges;
+    if (p.generation != generation || !file || !ranges) return;
+    const uint64_t *r = ranges.bytes;
+    NSUInteger count = ranges.length / (2 * sizeof(uint64_t));
+    uint64_t ahead = (uint64_t)(file.processingFormat.sampleRate * SONORA_AHEAD_SECONDS);
+    __weak SonoraPlayer *weak = p;
+    // Re-checked per segment: a forgotten schedule stops adding at once.
+    while (p.generation == generation && p.next < count && p.queued < SONORA_MAX_QUEUED &&
+           (p.queued < 2 || p.queuedFrames < ahead)) {
+        uint64_t end = r[2 * p.next + 1];
+        uint64_t frame = MAX(p.nextFrame, r[2 * p.next]);
+        AVAudioFrameCount chunk = (AVAudioFrameCount)MIN(end - frame, (uint64_t)UINT32_MAX);
+        p.queued += 1; p.queuedFrames += chunk;
+        p.nextFrame = frame + chunk;
+        if (p.nextFrame >= end) { p.next += 1; p.nextFrame = 0; }
+        @try {
+            [p.node scheduleSegment:file startingFrame:(AVAudioFramePosition)frame frameCount:chunk atTime:nil
+                completionCallbackType:AVAudioPlayerNodeCompletionDataConsumed
+                     completionHandler:^(__unused AVAudioPlayerNodeCompletionCallbackType type) {
+                SonoraPlayer *owner = weak;
+                if (!owner || owner.generation != generation) return;
+                dispatch_async(owner.queue, ^{
+                    if (owner.generation != generation) return;
+                    owner.queued -= 1; owner.queuedFrames -= chunk;
+                    sonora_schedule_more(owner, generation);
+                });
+            }];
+        } @catch (NSException *e) {
+            p.next = count; return;
+        }
+    }
+}
+// Invalidates the arranged schedule, then waits out any scheduling pass
+// already running on `queue`, so once this returns no stale segment can reach
+// the node and nothing on `queue` reads the old file or ranges. Call it before
+// stopping the node, rescheduling or replacing the file.
+//
+// Main thread only, never from `queue` (dispatch_sync onto itself would
+// deadlock). Safe from deadlock otherwise: `queue` blocks only schedule on
+// the node and never wait on the main thread, and node completion handlers
+// merely dispatch_async onto `queue`; later blocks see the new generation
+// and return without touching anything.
+static void sonora_forget_schedule(SonoraPlayer *p) {
+    p.generation += 1;
+    dispatch_sync(p.queue, ^{
+        p.scheduledFile = nil; p.ranges = nil;
+        p.next = 0; p.nextFrame = 0; p.queued = 0; p.queuedFrames = 0;
+    });
+}
+
 void *sonora_player_new(void) {
     @autoreleasepool {
         SonoraPlayer *p = [SonoraPlayer new];
         p.engine = [AVAudioEngine new]; p.node = [AVAudioPlayerNode new]; p.gain = [[AVAudioUnitEQ alloc] initWithNumberOfBands:0];
+        p.queue = dispatch_queue_create("io.sonora.player.schedule", DISPATCH_QUEUE_SERIAL);
         [p.engine attachNode:p.node]; [p.engine attachNode:p.gain];
         return (__bridge_retained void *)p;
     }
@@ -73,6 +146,7 @@ void *sonora_player_new(void) {
 int sonora_player_load(void *ptr, const char *path, char *err, size_t cap) {
     @autoreleasepool {
         SonoraPlayer *p = (__bridge SonoraPlayer *)ptr;
+        sonora_forget_schedule(p);
         [p.node stop]; [p.engine stop]; p.running = NO; p.paused = 0;
         NSError *error = nil;
         p.file = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithFileSystemRepresentation:path isDirectory:NO relativeToURL:nil] error:&error];
@@ -92,6 +166,7 @@ int sonora_player_play(void *ptr, double start, double end, float db, char *err,
         double rate = p.file.processingFormat.sampleRate;
         int64_t first = llround(start * rate), last = MIN(p.file.length, llround(end * rate));
         if (first < 0 || last <= first || last - first > UINT32_MAX) { error_text(err, cap, @"Choose a valid playback range shorter than 24 hours."); return -1; }
+        sonora_forget_schedule(p);
         [p.node stop]; p.running = NO;
         p.start = (double)first / rate; p.end = (double)last / rate; p.paused = p.start; p.gain.globalGain = db;
         NSError *error = nil;
@@ -103,6 +178,55 @@ int sonora_player_play(void *ptr, double start, double end, float db, char *err,
         return 0;
     }
 }
+// Play source segments back to back on one player node. Joins are queued on
+// the node ahead of time (never by the UI timer), with a bounded look-ahead;
+// only the range list (16 bytes per clip) is retained, never PCM.
+int sonora_player_play_ranges(void *ptr, const uint64_t *starts, const uint64_t *ends,
+                              size_t count, double timeline_start, float db,
+                              char *err, size_t cap) {
+    @autoreleasepool {
+        SonoraPlayer *p = (__bridge SonoraPlayer *)ptr;
+        if (!p.file || !count || !isfinite(timeline_start) || timeline_start < 0) {
+            error_text(err, cap, @"Choose a non-empty playback range."); return -1;
+        }
+        double rate = p.file.processingFormat.sampleRate;
+        uint64_t total = 0;
+        NSMutableData *ranges = [NSMutableData dataWithLength:count * 2 * sizeof(uint64_t)];
+        uint64_t *r = ranges.mutableBytes;
+        for (size_t i = 0; i < count; i++) {
+            if (ends[i] <= starts[i] || ends[i] > (uint64_t)p.file.length ||
+                UINT64_MAX - total < ends[i] - starts[i]) {
+                error_text(err, cap, @"Invalid source clip."); return -1;
+            }
+            total += ends[i] - starts[i];
+            r[2 * i] = starts[i]; r[2 * i + 1] = ends[i];
+        }
+        sonora_forget_schedule(p);
+        [p.node stop]; p.running = NO;
+        p.start = timeline_start; p.end = timeline_start + (double)total / rate;
+        p.paused = p.start; p.gain.globalGain = db;
+        uint64_t generation = p.generation;
+        AVAudioFile *file = p.file;
+        dispatch_sync(p.queue, ^{
+            p.scheduledFile = file; p.ranges = ranges;
+            p.next = 0; p.nextFrame = 0; p.queued = 0; p.queuedFrames = 0;
+            sonora_schedule_more(p, generation);
+        });
+        NSError *error = nil;
+        @try {
+            if (!p.engine.isRunning && ![p.engine startAndReturnError:&error]) {
+                sonora_forget_schedule(p);
+                [p.node stop]; error_text(err, cap, error.localizedDescription); return -1;
+            }
+            [p.node play]; p.running = YES;
+        } @catch (NSException *e) {
+            sonora_forget_schedule(p);
+            [p.node stop]; error_text(err, cap, e.reason); return -1;
+        }
+        return 0;
+    }
+}
+
 double sonora_player_position(void *ptr) {
     SonoraPlayer *p = (__bridge SonoraPlayer *)ptr;
     if (!p.running) return p.paused;
@@ -115,6 +239,7 @@ int sonora_player_is_playing(void *ptr) {
     SonoraPlayer *p = (__bridge SonoraPlayer *)ptr;
     if (!p.running) return 0;
     if (sonora_player_position(ptr) >= p.end) {
+        sonora_forget_schedule(p);
         p.paused = p.end; p.running = NO; [p.node stop]; [p.engine pause]; return 0;
     }
     return 1;
@@ -125,11 +250,12 @@ void sonora_player_pause(void *ptr) {
 }
 void sonora_player_stop(void *ptr) {
     SonoraPlayer *p = (__bridge SonoraPlayer *)ptr;
+    sonora_forget_schedule(p);
     p.running = NO; p.paused = 0; [p.node stop]; [p.engine pause];
 }
 void sonora_player_gain(void *ptr, float db) { ((__bridge SonoraPlayer *)ptr).gain.globalGain = db; }
 void sonora_player_free(void *ptr) {
-    @autoreleasepool { SonoraPlayer *p = CFBridgingRelease(ptr); [p.node stop]; [p.engine stop]; }
+    @autoreleasepool { SonoraPlayer *p = CFBridgingRelease(ptr); sonora_forget_schedule(p); [p.node stop]; [p.engine stop]; }
 }
 void sonora_reveal(const char *path) {
     @autoreleasepool { [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[[NSURL fileURLWithFileSystemRepresentation:path isDirectory:NO relativeToURL:nil]]]; }

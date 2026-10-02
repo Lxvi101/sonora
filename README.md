@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-white.svg)](LICENSE)
 
 
-A small, native macOS audio editor: drop an audio recording or video, trim its audio, adjust its volume, preview, and export a new audio file. Rust + GPUI, rendered with Metal. A monochrome dot-matrix interface, native macOS file dialogs, audio decoding and playback. No browser runtime, account, or analytics. Editing stays on your Mac; the optional updater checks GitHub for signed releases.
+A small, native macOS audio editor: drop an audio recording or video, cut and rearrange its audio, adjust its volume, preview, and export a new audio file. Rust + GPUI, rendered with Metal. A monochrome dot-matrix interface, native macOS file dialogs, audio decoding and playback. No browser runtime, account, or analytics. Editing stays on your Mac; the optional updater checks GitHub for signed releases.
 
 The audio engine uses Apple's AVAudioEngine and AudioToolbox through a small Objective-C bridge. The interface uses GPUI and Metal. [Zeron](https://github.com/zeronsh/zeron) inspired the native approach; its source is not bundled or copied. Sonora was developed with AI assistance, including the Opus-authored interface.
 
@@ -36,6 +36,12 @@ The app bundle declares common audio types for Finder's **Open With** menu. To m
 
 ## Editing
 
+See the [basic clip editing guide](docs/EDITING.md) for a short walkthrough.
+
+- **C** selects the cut tool; click a clip to split it. **⌘B** cuts at the playhead.
+- **V** selects the arrow tool; click a clip to select it. **Delete / Backspace** removes selected clips and closes the gap. Drag the clip bars above the waveform to reorder at the insertion marker.
+- **⌘A** selects all clips; **Escape** clears selection and returns to the arrow tool. Cuts, deletion and movement support undo/redo.
+
 - **Drop audio or video anywhere in the window**, including over an existing recording. MP4, MOV and M4V imports use the first audio track, starting at that track's beginning. Files with no readable audio show an error. Exports contain audio only; the source video is unchanged.
 - **Drag an edge** to trim. **Double-click the left edge** to reset its start to zero; **double-click the right edge** to reset its end to the full recording. The other edge and gain stay unchanged; undo restores the prior edge.
 - **Click the waveform** to seek; **drag across it** to select a range.
@@ -45,7 +51,7 @@ The app bundle declares common audio types for Finder's **Open With** menu. To m
 - **I / O** set the start/end at the playhead; **Shift-I / Shift-O** restore those edges.
 - **Left/right** seek 1 second; **Shift-left/right** seek 5 seconds; **Option-left/right** seek 10 milliseconds.
 - Gain spans **−24 to +24 dB**. **+ / −** nudge it; **0** or a **double-click on the gain slider** resets it.
-- **⌘Z / ⇧⌘Z** undo/redo. **⌘A** keeps the full recording; **⌘⌫** resets trim and gain.
+- **⌘Z / ⇧⌘Z** undo/redo. **⌘⌫** resets the arrangement, trim and gain.
 - Choose **WAV / MP3 / M4A** before exporting (**⌘1 / ⌘2 / ⌘3**). **⇧⌘S** opens the native save dialog with the selected extension. The format choice persists while opening other files during the session.
 - **?** opens the control guide. **⌘O** opens a file; **⌘W** closes it.
 
@@ -68,7 +74,7 @@ Video import uses AVFoundation. AAC/ALAC soundtracks are copied into a private M
 ## Performance design
 
 - Opening probes metadata; it does not decode the recording.
-- Playback schedules a native AVAudioFile segment, without keeping a whole-file PCM array.
+- Playback schedules native AVAudioFile segments in arranged order, without keeping a whole-file PCM array.
 - Waveform analysis runs off the UI thread. It publishes a sparse preview first, then an exact sequential scan.
 - The overview is always 2,048 min/max bins. Decode buffers contain 16,384 frames regardless of recording duration.
 - Waveforms are cached in `~/Library/Caches/io.sonora.editor`, keyed by path, size, modification time, sample rate and frame count. The cache retains at most 128 small overviews (about 2 MiB).
@@ -78,7 +84,7 @@ Video import uses AVFoundation. AAC/ALAC soundtracks are copied into a private M
 
 ## Verification
 
-All 41 tests pass, along with formatting and all-target Clippy. The redesigned window's mouse controls, edge resets, gain reset, A/B, loop playback, zoom and native MP3/M4A exports were exercised. Keyboard playback, format selection and Undo were checked, along with cold and warm Launch Services video opening, no-audio errors, and a trimmed/amplified MP3 export from MOV. The installed app's 841-pixel tiled layout was checked with positive gain and the full format/export controls visible. Cross-application dragging could not be completed by the automation tool; the whole-window drop handler is implemented but the physical Finder-to-window gesture remains a manual verification item.
+The 0.3.0 release passed 41 tests, formatting and all-target Clippy. Clip editing adds frame-preservation and sample-order regression tests plus a native sequence playback check; see [the editing guide](docs/EDITING.md). The redesigned window's mouse controls, edge resets, gain reset, A/B, loop playback, zoom and native MP3/M4A exports were exercised. Keyboard playback, format selection and Undo were checked, along with cold and warm Launch Services video opening, no-audio errors, and a trimmed/amplified MP3 export from MOV. The installed app's 841-pixel tiled layout was checked with positive gain and the full format/export controls visible. Cross-application dragging could not be completed by the automation tool; the whole-window drop handler is implemented but the physical Finder-to-window gesture remains a manual verification item.
 
 ```sh
 cargo test --locked --offline

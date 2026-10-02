@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use gpui::Application;
 // The engine lives in the library crate; importing it here lets the UI refer
-// to it as `crate::audio`.
-use sonora::audio;
+// to it as `crate::audio` and `crate::timeline`.
+use sonora::{audio, timeline};
 
 mod ui;
 mod updater;

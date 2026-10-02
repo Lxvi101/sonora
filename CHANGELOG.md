@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0
+
+- Basic single-track clip editing: cut, select, ripple delete and drag to reorder.
+- Frame-based non-destructive arrangement, native sequence playback and streaming WAV/MP3/M4A exports.
+- Clip editing and release/Keychain troubleshooting documentation.
+
 ## 0.3.0
 
 - Native Sparkle updater: daily checks, a manual Check for Updates command, signed feeds and signed update archives.
